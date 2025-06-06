@@ -266,14 +266,14 @@ void draw_panel(terminal_panel_t *panel, int panel_index) {
         if (type == PANEL_TYPE_OVERLAY) {
             mvwprintw(panel->win, 0, 2, " Overlay %d [ACTIVE] ", panel_index);
         } else {
-            mvwprintw(panel->win, 0, 2, " Terminal %d [ACTIVE] ", panel_index);
+            mvwprintw(panel->win, 0, 2, " Main Terminal [ACTIVE] ");
         }
         wattroff(panel->win, A_BOLD);
     } else {
         if (type == PANEL_TYPE_OVERLAY) {
             mvwprintw(panel->win, 0, 2, " Overlay %d ", panel_index);
         } else {
-            mvwprintw(panel->win, 0, 2, " Terminal %d ", panel_index);
+            mvwprintw(panel->win, 0, 2, " Main Terminal ");
         }
     }
     
@@ -447,15 +447,15 @@ int create_overlay_panel(void) {
         return -1; // No more panels available
     }
     
-    // Calculate overlay panel size and position (centered, 60% of screen size)
-    int overlay_width = (mux.screen_width * 3) / 5;
-    int overlay_height = (mux.screen_height * 3) / 5;
+    // Calculate overlay panel size and position (centered, 50% of screen size - smaller than main)
+    int overlay_width = (mux.screen_width * 1) / 2;
+    int overlay_height = (mux.screen_height * 1) / 2;
     int overlay_x = (mux.screen_width - overlay_width) / 2;
     int overlay_y = (mux.screen_height - overlay_height) / 2;
     
     // Ensure minimum size
-    if (overlay_width < 20) overlay_width = 20;
-    if (overlay_height < 10) overlay_height = 10;
+    if (overlay_width < 25) overlay_width = 25;
+    if (overlay_height < 12) overlay_height = 12;
     
     int panel_index = mux.panel_count;
     
@@ -772,15 +772,31 @@ void init_multiplexer() {
         exit(1);
     }
     
-    // Create initial main panel (full screen)
+    // Create initial main panel (centered, similar to overlay size)
     mux.panel_count = 1;
     mux.active_panel = 0;
     
-    // Create single full-screen panel
-    int panel_width = mux.screen_width;
-    int panel_height = mux.screen_height - 1; // Leave space for status line
+    // Calculate main panel size and position (centered, 70% of screen size for better visibility)
+    int panel_width = (mux.screen_width * 7) / 10;
+    int panel_height = (mux.screen_height * 7) / 10;
+    int panel_x = (mux.screen_width - panel_width) / 2;
+    int panel_y = (mux.screen_height - panel_height) / 2;
     
-    if (create_terminal_panel(&mux.panels[0], 0, 0, 
+    // Ensure minimum size
+    if (panel_width < 30) panel_width = 30;
+    if (panel_height < 15) panel_height = 15;
+    
+    // Ensure it fits on screen
+    if (panel_x < 0) panel_x = 0;
+    if (panel_y < 0) panel_y = 0;
+    if (panel_x + panel_width > mux.screen_width) {
+        panel_width = mux.screen_width - panel_x;
+    }
+    if (panel_y + panel_height > mux.screen_height - 1) { // Leave space for status line
+        panel_height = mux.screen_height - 1 - panel_y;
+    }
+    
+    if (create_terminal_panel(&mux.panels[0], panel_x, panel_y, 
                              panel_width, panel_height, PANEL_TYPE_MAIN) == -1) {
         endwin();
         fprintf(stderr, "Failed to create main panel\n");
@@ -940,10 +956,16 @@ int main() {
                         " COMMAND | q:quit | n:next | p:prev | c:create | x:close | f:front | 0-7:panel | ESC:cancel ");
                 wattroff(stdscr, A_REVERSE);
             } else {
-                const char *panel_type = (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) ? "Overlay" : "Main";
-                mvprintw(mux.screen_height - 1, 0, 
-                        "%s Panel %d | Ctrl+A Ctrl+A: command mode", 
-                        panel_type, mux.active_panel);
+                const char *panel_type = (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) ? "Overlay" : "Main Terminal";
+                if (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) {
+                    mvprintw(mux.screen_height - 1, 0, 
+                            "%s %d | Ctrl+A Ctrl+A: command mode", 
+                            panel_type, mux.active_panel);
+                } else {
+                    mvprintw(mux.screen_height - 1, 0, 
+                            "%s | Ctrl+A Ctrl+A: command mode", 
+                            panel_type);
+                }
             }
             mux.status_line_dirty = false;
         }
