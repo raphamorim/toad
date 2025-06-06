@@ -3,14 +3,32 @@ CFLAGS = -Wall -Wextra -std=c99
 LIBS = -lncurses -lutil
 TARGET = toad
 SRCDIR = src
-SOURCES = $(SRCDIR)/main.c
+VTEDIR = $(SRCDIR)/vte
+
+# Source files
+MAIN_SOURCES = $(SRCDIR)/main.c
+VTE_SOURCES = $(VTEDIR)/vte_parser.c
+SOURCES = $(MAIN_SOURCES) $(VTE_SOURCES)
+
+# Object files
+MAIN_OBJECTS = $(MAIN_SOURCES:.c=.o)
+VTE_OBJECTS = $(VTE_SOURCES:.c=.o)
+OBJECTS = $(MAIN_OBJECTS) $(VTE_OBJECTS)
 
 # Default target
 all: $(TARGET)
 
 # Build the executable
-$(TARGET): $(SOURCES)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LIBS)
+$(TARGET): $(OBJECTS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJECTS) $(LIBS)
+
+# Compile main source
+$(SRCDIR)/%.o: $(SRCDIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Compile VTE source
+$(VTEDIR)/%.o: $(VTEDIR)/%.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # Debug build
 debug: CFLAGS += -g -DDEBUG
@@ -26,7 +44,7 @@ run: $(TARGET)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(OBJECTS)
 
 # Install dependencies (macOS)
 install-deps:

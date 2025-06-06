@@ -4,31 +4,17 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
 #include <util.h>
 
 #include <ncurses.h>
+#include "vte/vte_parser.h"
 
 #define MAX_PANELS 4
 #define BUFFER_SIZE 1024
-#define MAX_LINES 1000
-
-typedef struct {
-    WINDOW *win;
-    int master_fd;
-    pid_t child_pid;
-    char **lines;
-    int line_count;
-    int scroll_offset;
-    int active;
-    int width, height;
-    int start_x, start_y;
-    int cursor_x, cursor_y;
-    char current_line[BUFFER_SIZE];
-    int current_line_pos;
-} terminal_panel_t;
 
 typedef struct {
     terminal_panel_t panels[MAX_PANELS];
@@ -49,60 +35,49 @@ void cleanup_and_exit(int sig) {
     exit(0);
 }
 
-void init_panel_lines(terminal_panel_t *panel) {
-    panel->lines = calloc(MAX_LINES, sizeof(char*));
-    if (!panel->lines) {
-        fprintf(stderr, "Failed to allocate memory for panel lines\n");
+void init_panel_screen(terminal_panel_t *panel) {
+    panel->screen_width = panel->width - 2; // Account for borders
+    panel->screen_height = panel->height - 2;
+    
+    // Allocate screen buffer
+    panel->screen = malloc(panel->screen_height * sizeof(terminal_cell_t*));
+    if (!panel->screen) {
+        fprintf(stderr, "Failed to allocate screen buffer\n");
         exit(1);
     }
     
-    for (int i = 0; i < MAX_LINES; i++) {
-        panel->lines[i] = calloc(BUFFER_SIZE, sizeof(char));
-        if (!panel->lines[i]) {
-            fprintf(stderr, "Failed to allocate memory for line %d\n", i);
+    for (int y = 0; y < panel->screen_height; y++) {
+        panel->screen[y] = malloc(panel->screen_width * sizeof(terminal_cell_t));
+        if (!panel->screen[y]) {
+            fprintf(stderr, "Failed to allocate screen line %d\n", y);
             exit(1);
         }
+        
+        // Initialize cells
+        for (int x = 0; x < panel->screen_width; x++) {
+            panel->screen[y][x].ch = ' ';
+            panel->screen[y][x].fg_color = -1;
+            panel->screen[y][x].bg_color = -1;
+            panel->screen[y][x].attrs = A_NORMAL;
+        }
     }
     
-    panel->line_count = 0;
-    panel->scroll_offset = 0;
+    panel->cursor_x = 0;
+    panel->cursor_y = 0;
+    
+    vte_parser_init(&panel->parser);
 }
 
-void free_panel_lines(terminal_panel_t *panel) {
-    if (panel->lines) {
-        for (int i = 0; i < MAX_LINES; i++) {
-            if (panel->lines[i]) {
-                free(panel->lines[i]);
+void free_panel_screen(terminal_panel_t *panel) {
+    if (panel->screen) {
+        for (int y = 0; y < panel->screen_height; y++) {
+            if (panel->screen[y]) {
+                free(panel->screen[y]);
             }
         }
-        free(panel->lines);
-        panel->lines = NULL;
+        free(panel->screen);
+        panel->screen = NULL;
     }
-}
-
-void add_line_to_panel(terminal_panel_t *panel, const char *line) {
-    if (!panel || !panel->lines || !line) {
-        return;
-    }
-    
-    if (panel->line_count >= MAX_LINES) {
-        // Shift lines up
-        if (panel->lines[0]) {
-            free(panel->lines[0]);
-        }
-        for (int i = 0; i < MAX_LINES - 1; i++) {
-            panel->lines[i] = panel->lines[i + 1];
-        }
-        panel->lines[MAX_LINES - 1] = calloc(BUFFER_SIZE, sizeof(char));
-        if (!panel->lines[MAX_LINES - 1]) {
-            return;
-        }
-        panel->line_count = MAX_LINES - 1;
-    }
-    
-    strncpy(panel->lines[panel->line_count], line, BUFFER_SIZE - 1);
-    panel->lines[panel->line_count][BUFFER_SIZE - 1] = '\0';
-    panel->line_count++;
 }
 
 int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int height) {
@@ -119,10 +94,6 @@ int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int 
     panel->active = 1;
     panel->master_fd = -1;
     panel->child_pid = -1;
-    panel->cursor_x = 1;
-    panel->cursor_y = 1;
-    panel->current_line_pos = 0;
-    panel->current_line[0] = '\0';
     
     // Create ncurses window
     panel->win = newwin(height, width, y, x);
@@ -131,15 +102,15 @@ int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int 
         return -1;
     }
     
-    // Initialize line storage
-    init_panel_lines(panel);
+    // Initialize screen buffer
+    init_panel_screen(panel);
     
     // Create pseudo-terminal
     int slave_fd;
     if (openpty(&panel->master_fd, &slave_fd, NULL, NULL, NULL) == -1) {
         fprintf(stderr, "Failed to create pty: %s\n", strerror(errno));
         delwin(panel->win);
-        free_panel_lines(panel);
+        free_panel_screen(panel);
         return -1;
     }
     
@@ -150,7 +121,7 @@ int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int 
         close(panel->master_fd);
         close(slave_fd);
         delwin(panel->win);
-        free_panel_lines(panel);
+        free_panel_screen(panel);
         return -1;
     }
     
@@ -166,8 +137,16 @@ int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int 
         close(panel->master_fd);
         close(slave_fd);
         
+        // Set terminal size
+        struct winsize ws;
+        ws.ws_row = panel->screen_height;
+        ws.ws_col = panel->screen_width;
+        ws.ws_xpixel = 0;
+        ws.ws_ypixel = 0;
+        ioctl(STDOUT_FILENO, TIOCSWINSZ, &ws);
+        
         // Execute shell
-        execl("/bin/bash", "bash", NULL);
+        execl("/bin/zsh", "zsh", NULL);
         exit(1);
     }
     
@@ -184,7 +163,7 @@ int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int 
 }
 
 void draw_panel(terminal_panel_t *panel) {
-    if (!panel || !panel->active || !panel->win) {
+    if (!panel || !panel->active || !panel->win || !panel->screen) {
         return;
     }
     
@@ -192,43 +171,69 @@ void draw_panel(terminal_panel_t *panel) {
     box(panel->win, 0, 0);
     
     // Draw title
-    mvwprintw(panel->win, 0, 2, " Terminal %d ", 
-              (int)(panel - mux.panels));
-    
-    // Draw content
-    int display_height = panel->height - 3; // Account for borders and current line
-    int start_line = panel->scroll_offset;
-    int end_line = start_line + display_height;
-    
-    if (end_line > panel->line_count) {
-        end_line = panel->line_count;
+    if (panel == &mux.panels[mux.active_panel]) {
+        wattron(panel->win, A_BOLD);
+        mvwprintw(panel->win, 0, 2, " Terminal %d [ACTIVE] ", 
+                  (int)(panel - mux.panels));
+        wattroff(panel->win, A_BOLD);
+    } else {
+        mvwprintw(panel->win, 0, 2, " Terminal %d ", 
+                  (int)(panel - mux.panels));
     }
     
-    for (int i = start_line; i < end_line; i++) {
-        if (i >= 0 && i < panel->line_count && panel->lines[i]) {
-            int display_width = panel->width - 2; // Account for borders
-            char display_line[display_width + 1];
-            strncpy(display_line, panel->lines[i], display_width);
-            display_line[display_width] = '\0';
-            mvwprintw(panel->win, i - start_line + 1, 1, "%s", display_line);
+    // Draw screen content
+    for (int y = 0; y < panel->screen_height; y++) {
+        for (int x = 0; x < panel->screen_width; x++) {
+            terminal_cell_t *cell = &panel->screen[y][x];
+            
+            if (cell->ch != ' ' || cell->bg_color != -1) {
+                // Calculate color pair
+                int color_pair = 0;
+                if (cell->fg_color != -1 || cell->bg_color != -1) {
+                    int fg = (cell->fg_color == -1) ? -1 : cell->fg_color;
+                    int bg = (cell->bg_color == -1) ? -1 : cell->bg_color;
+                    
+                    // Find or create color pair
+                    for (int i = 1; i < COLOR_PAIRS && i < 64; i++) {
+                        short pair_fg, pair_bg;
+                        pair_content(i, &pair_fg, &pair_bg);
+                        if (pair_fg == fg && pair_bg == bg) {
+                            color_pair = i;
+                            break;
+                        }
+                        if (pair_fg == 0 && pair_bg == 0) {
+                            init_pair(i, fg, bg);
+                            color_pair = i;
+                            break;
+                        }
+                    }
+                }
+                
+                // Apply attributes and colors
+                if (cell->attrs != A_NORMAL) {
+                    wattron(panel->win, cell->attrs);
+                }
+                if (color_pair > 0) {
+                    wattron(panel->win, COLOR_PAIR(color_pair));
+                }
+                
+                mvwaddch(panel->win, y + 1, x + 1, cell->ch);
+                
+                if (color_pair > 0) {
+                    wattroff(panel->win, COLOR_PAIR(color_pair));
+                }
+                if (cell->attrs != A_NORMAL) {
+                    wattroff(panel->win, cell->attrs);
+                }
+            }
         }
     }
     
-    // Draw current input line
-    int input_line_y = panel->height - 2;
-    mvwprintw(panel->win, input_line_y, 1, "$ %s", panel->current_line);
-    
-    // Show cursor in active panel
+    // Highlight active panel border
     if (panel == &mux.panels[mux.active_panel]) {
         wattron(panel->win, A_BOLD);
         box(panel->win, 0, 0);
         wattroff(panel->win, A_BOLD);
-        
-        // Position cursor
-        int cursor_pos = 3 + panel->current_line_pos; // 3 = "$ " + current pos
-        if (cursor_pos < panel->width - 1) {
-            wmove(panel->win, input_line_y, cursor_pos);
-        }
     }
     
     wrefresh(panel->win);
@@ -240,39 +245,11 @@ void read_panel_data(terminal_panel_t *panel) {
     }
     
     char buffer[BUFFER_SIZE];
-    static char line_buffers[MAX_PANELS][BUFFER_SIZE] = {{0}};
-    static int line_positions[MAX_PANELS] = {0};
-    
-    int panel_idx = panel - mux.panels;
-    if (panel_idx < 0 || panel_idx >= MAX_PANELS) {
-        return;
-    }
-    
     ssize_t bytes_read = read(panel->master_fd, buffer, sizeof(buffer) - 1);
+    
     if (bytes_read > 0) {
-        buffer[bytes_read] = '\0';
-        
-        // Process character by character
-        for (int i = 0; i < bytes_read; i++) {
-            char c = buffer[i];
-            
-            if (c == '\n' || c == '\r') {
-                if (line_positions[panel_idx] > 0) {
-                    line_buffers[panel_idx][line_positions[panel_idx]] = '\0';
-                    add_line_to_panel(panel, line_buffers[panel_idx]);
-                    line_positions[panel_idx] = 0;
-                }
-            } else if (c >= 32 && c <= 126) { // Printable characters
-                if (line_positions[panel_idx] < BUFFER_SIZE - 1) {
-                    line_buffers[panel_idx][line_positions[panel_idx]++] = c;
-                }
-            }
-        }
-        
-        // Auto-scroll to bottom
-        if (panel->line_count > panel->height - 3) {
-            panel->scroll_offset = panel->line_count - (panel->height - 3);
-        }
+        // Feed data to VTE parser
+        vte_parser_feed(panel, buffer, bytes_read);
     } else if (bytes_read == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
         // Error reading from pty
         panel->active = 0;
@@ -303,77 +280,24 @@ void handle_input() {
             mux.active_panel = (mux.active_panel + 1) % mux.panel_count;
             break;
             
-        case KEY_UP:
-            if (active->scroll_offset > 0) {
-                active->scroll_offset--;
-            }
-            break;
-            
-        case KEY_DOWN:
-            if (active->scroll_offset < active->line_count - (active->height - 3)) {
-                active->scroll_offset++;
-            }
-            break;
-            
-        case KEY_LEFT:
-            if (active->current_line_pos > 0) {
-                active->current_line_pos--;
-            }
-            break;
-            
-        case KEY_RIGHT:
-            if (active->current_line_pos < (int)strlen(active->current_line)) {
-                active->current_line_pos++;
-            }
-            break;
-            
-        case KEY_BACKSPACE:
-        case 127: // DEL key
-        case 8:   // Backspace
-            if (active->current_line_pos > 0) {
-                // Remove character from current line
-                memmove(&active->current_line[active->current_line_pos - 1],
-                       &active->current_line[active->current_line_pos],
-                       strlen(active->current_line) - active->current_line_pos + 1);
-                active->current_line_pos--;
-                
-                // Send backspace to terminal
-                if (active->master_fd >= 0) {
-                    write(active->master_fd, "\b", 1);
-                }
-            }
-            break;
-            
-        case '\n':
-        case '\r':
-            // Send the complete line to terminal
-            if (active->master_fd >= 0) {
-                write(active->master_fd, active->current_line, strlen(active->current_line));
-                write(active->master_fd, "\n", 1);
-            }
-            
-            // Clear current line
-            active->current_line[0] = '\0';
-            active->current_line_pos = 0;
-            break;
-            
         default:
-            // Add printable characters to current line
-            if (ch >= 32 && ch <= 126) {
-                int len = strlen(active->current_line);
-                if (len < BUFFER_SIZE - 1) {
-                    // Insert character at cursor position
-                    memmove(&active->current_line[active->current_line_pos + 1],
-                           &active->current_line[active->current_line_pos],
-                           len - active->current_line_pos + 1);
-                    active->current_line[active->current_line_pos] = ch;
-                    active->current_line_pos++;
-                    
-                    // Send character to terminal
-                    if (active->master_fd >= 0) {
-                        char c = ch;
-                        write(active->master_fd, &c, 1);
-                    }
+            // Send ALL other input directly to the active terminal
+            if (active->master_fd >= 0) {
+                if (ch == '\n' || ch == '\r') {
+                    write(active->master_fd, "\r", 1);
+                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                    write(active->master_fd, "\b", 1);
+                } else if (ch == KEY_LEFT) {
+                    write(active->master_fd, "\033[D", 3);
+                } else if (ch == KEY_RIGHT) {
+                    write(active->master_fd, "\033[C", 3);
+                } else if (ch == KEY_UP) {
+                    write(active->master_fd, "\033[A", 3);
+                } else if (ch == KEY_DOWN) {
+                    write(active->master_fd, "\033[B", 3);
+                } else if (ch >= 32 && ch <= 126) {
+                    char c = ch;
+                    write(active->master_fd, &c, 1);
                 }
             }
             break;
@@ -390,6 +314,21 @@ void init_multiplexer() {
     if (stdscr == NULL) {
         fprintf(stderr, "Failed to initialize ncurses\n");
         exit(1);
+    }
+    
+    // Enable colors
+    if (has_colors()) {
+        start_color();
+        use_default_colors();
+        
+        // Initialize basic color pairs
+        init_pair(1, COLOR_RED, -1);
+        init_pair(2, COLOR_GREEN, -1);
+        init_pair(3, COLOR_YELLOW, -1);
+        init_pair(4, COLOR_BLUE, -1);
+        init_pair(5, COLOR_MAGENTA, -1);
+        init_pair(6, COLOR_CYAN, -1);
+        init_pair(7, COLOR_WHITE, -1);
     }
     
     cbreak();
@@ -450,7 +389,7 @@ void cleanup_multiplexer() {
             delwin(panel->win);
         }
         
-        free_panel_lines(panel);
+        free_panel_screen(panel);
     }
     
     // Restore terminal state
@@ -524,7 +463,7 @@ int main() {
         
         // Status line
         mvprintw(mux.screen_height - 1, 0, 
-                "Active: %d | Tab: switch | q/ESC/Ctrl+C: quit | ↑↓: scroll | ←→: cursor", 
+                "Active: %d | Tab: switch | q/ESC/Ctrl+C: quit", 
                 mux.active_panel + 1);
         clrtoeol();
         refresh();
