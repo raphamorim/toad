@@ -125,6 +125,12 @@ static void test_csi_dispatch(terminal_panel_t *panel, const vte_params_t *param
                     break;
             }
         }
+    } else if (action == 'H' || action == 'f') { // Cursor position
+        uint16_t row = vte_params_get_single(params, 0, 1) - 1;
+        uint16_t col = vte_params_get_single(params, 1, 1) - 1;
+        
+        if (row < panel->screen_height) panel->cursor_y = row;
+        if (col < panel->screen_width) panel->cursor_x = col;
     }
 }
 
@@ -345,6 +351,41 @@ int test_utf8_utilities() {
     return 1;
 }
 
+int test_cursor_positioning() {
+    setup_test();
+    
+    // Test basic cursor advancement
+    parse_input("Hello");
+    if (test_panel.cursor_x != 5 || test_panel.cursor_y != 0) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Test newline
+    parse_input("\nWorld");
+    if (test_panel.cursor_x != 5 || test_panel.cursor_y != 1) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Test cursor positioning escape sequence
+    parse_input("\033[3;10H*");  // Move to row 3, col 10, then print *
+    if (test_panel.cursor_x != 10 || test_panel.cursor_y != 2) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Test carriage return
+    parse_input("\rStart");
+    if (test_panel.cursor_x != 5 || test_panel.cursor_y != 2) {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
 int test_complex_sequences() {
     setup_test();
     
@@ -389,6 +430,7 @@ int main() {
     TEST(background_colors);
     TEST(parameter_parsing);
     TEST(utf8_utilities);
+    TEST(cursor_positioning);
     TEST(complex_sequences);
     
     // Print results

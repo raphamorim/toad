@@ -9,12 +9,19 @@
 #include <errno.h>
 #include <signal.h>
 #include <util.h>
+#include <time.h>
 
 #include <ncurses.h>
 #include "vte/vte_parser.h"
 
 #define MAX_PANELS 4
 #define BUFFER_SIZE 1024
+#define CTRL_KEY(k) ((k) & 0x1f)
+
+typedef enum {
+    MODE_NORMAL,    // All input goes to terminal
+    MODE_COMMAND    // Waiting for command key
+} input_mode_t;
 
 typedef struct {
     terminal_panel_t panels[MAX_PANELS];
@@ -22,17 +29,34 @@ typedef struct {
     int active_panel;
     int screen_width, screen_height;
     int should_quit;
+    
+    // Input mode system
+    input_mode_t mode;
+    int ctrl_count;
 } multiplexer_t;
 
 static multiplexer_t mux;
 
 // Function declarations
 void cleanup_multiplexer(void);
+void enter_command_mode(void);
+void exit_command_mode(void);
 
 void cleanup_and_exit(int sig) {
     (void)sig;
     cleanup_multiplexer();
     exit(0);
+}
+
+// Helper functions for mode system
+void enter_command_mode(void) {
+    mux.mode = MODE_COMMAND;
+    mux.ctrl_count = 0;
+}
+
+void exit_command_mode(void) {
+    mux.mode = MODE_NORMAL;
+    mux.ctrl_count = 0;
 }
 
 void init_panel_screen(terminal_panel_t *panel) {
@@ -280,6 +304,72 @@ void draw_panel(terminal_panel_t *panel) {
         wattroff(panel->win, A_BOLD);
     }
     
+    // Draw cursor for active panel
+    if (panel == &mux.panels[mux.active_panel] && 
+        panel->cursor_y >= 0 && panel->cursor_y < panel->screen_height &&
+        panel->cursor_x >= 0 && panel->cursor_x < panel->screen_width) {
+        
+        // Get the character at cursor position
+        terminal_cell_t *cursor_cell = &panel->screen[panel->cursor_y][panel->cursor_x];
+        
+        // Determine what character to show at cursor
+        char cursor_char = ' ';
+        int cursor_attrs = A_REVERSE;
+        int cursor_color_pair = 0;
+        
+        if (cursor_cell->codepoint != 0 && cursor_cell->codepoint != ' ') {
+            cursor_char = (cursor_cell->codepoint <= 0x7F) ? (char)cursor_cell->codepoint : '?';
+            
+            // Apply the cell's original colors but with reverse video
+            if (cursor_cell->fg_color != -1 || cursor_cell->bg_color != -1) {
+                int fg = (cursor_cell->fg_color == -1) ? -1 : cursor_cell->fg_color;
+                int bg = (cursor_cell->bg_color == -1) ? -1 : cursor_cell->bg_color;
+                
+                // Find or create color pair (same logic as before)
+                bool found = false;
+                for (int i = 1; i < COLOR_PAIRS && i < 64; i++) {
+                    short pair_fg, pair_bg;
+                    pair_content(i, &pair_fg, &pair_bg);
+                    if (pair_fg == fg && pair_bg == bg) {
+                        cursor_color_pair = i;
+                        found = true;
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    for (int i = 16; i < COLOR_PAIRS && i < 64; i++) {
+                        short pair_fg, pair_bg;
+                        pair_content(i, &pair_fg, &pair_bg);
+                        if (pair_fg == 0 && pair_bg == 0) {
+                            init_pair(i, fg, bg);
+                            cursor_color_pair = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Combine original attributes with reverse video
+            cursor_attrs = cursor_cell->attrs | A_REVERSE;
+        }
+        
+        // Apply cursor attributes and colors
+        if (cursor_color_pair > 0) {
+            wattron(panel->win, COLOR_PAIR(cursor_color_pair));
+        }
+        wattron(panel->win, cursor_attrs);
+        
+        // Draw the cursor
+        mvwaddch(panel->win, panel->cursor_y + 1, panel->cursor_x + 1, cursor_char);
+        
+        // Remove cursor attributes and colors
+        wattroff(panel->win, cursor_attrs);
+        if (cursor_color_pair > 0) {
+            wattroff(panel->win, COLOR_PAIR(cursor_color_pair));
+        }
+    }
+    
     wrefresh(panel->win);
 }
 
@@ -306,45 +396,114 @@ void handle_input() {
         return; // No input available
     }
     
-    // IMMEDIATE quit check - handle before anything else
-    if (ch == 113 || ch == 81 || ch == 27 || ch == 3) { // q, Q, ESC, Ctrl+C
-        mux.should_quit = 1;
-        cleanup_multiplexer(); // Force immediate cleanup
-        exit(0); // Force exit
-    }
-    
     if (mux.active_panel >= mux.panel_count) {
         return;
     }
     
     terminal_panel_t *active = &mux.panels[mux.active_panel];
     
-    switch (ch) {
-        case '\t': // Switch panels
-            mux.active_panel = (mux.active_panel + 1) % mux.panel_count;
-            break;
-            
-        default:
-            // Send ALL other input directly to the active terminal
-            if (active->master_fd >= 0) {
-                if (ch == '\n' || ch == '\r') {
-                    write(active->master_fd, "\r", 1);
-                } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
-                    write(active->master_fd, "\b", 1);
-                } else if (ch == KEY_LEFT) {
-                    write(active->master_fd, "\033[D", 3);
-                } else if (ch == KEY_RIGHT) {
-                    write(active->master_fd, "\033[C", 3);
-                } else if (ch == KEY_UP) {
-                    write(active->master_fd, "\033[A", 3);
-                } else if (ch == KEY_DOWN) {
-                    write(active->master_fd, "\033[B", 3);
-                } else if (ch >= 32 && ch <= 126) {
-                    char c = ch;
-                    write(active->master_fd, &c, 1);
+    // Handle input based on current mode
+    if (mux.mode == MODE_COMMAND) {
+        // Command mode - handle multiplexer commands
+        switch (ch) {
+            case 'q':
+            case 'Q':
+                // Quit
+                mux.should_quit = 1;
+                cleanup_multiplexer();
+                exit(0);
+                break;
+                
+            case '\t':
+            case 'n':
+            case 'N':
+                // Switch to next panel
+                mux.active_panel = (mux.active_panel + 1) % mux.panel_count;
+                exit_command_mode();
+                break;
+                
+            case 'p':
+            case 'P':
+                // Switch to previous panel
+                mux.active_panel = (mux.active_panel - 1 + mux.panel_count) % mux.panel_count;
+                exit_command_mode();
+                break;
+                
+            case 'a':
+            case 'A':
+                // Send literal Ctrl+A to terminal (like screen does)
+                if (active->master_fd >= 0) {
+                    write(active->master_fd, "\001", 1); // Ctrl+A
                 }
+                exit_command_mode();
+                break;
+                
+            case '1':
+            case '2':
+            case '3':
+            case '4':
+                // Switch to specific panel
+                {
+                    int panel_num = ch - '1';
+                    if (panel_num >= 0 && panel_num < mux.panel_count) {
+                        mux.active_panel = panel_num;
+                    }
+                    exit_command_mode();
+                }
+                break;
+                
+            case 27: // ESC
+                // Exit command mode without action
+                exit_command_mode();
+                break;
+                
+            default:
+                // Unknown command, exit command mode
+                exit_command_mode();
+                break;
+        }
+    } else {
+        // Normal mode - handle Control key detection and pass through to terminal
+        // Use Ctrl+A twice as the trigger (like GNU Screen)
+        if (ch == CTRL_KEY('a')) {
+            if (mux.ctrl_count == 0) {
+                // First Ctrl+A
+                mux.ctrl_count = 1;
+                return; // Don't send to terminal
+            } else if (mux.ctrl_count == 1) {
+                // Second Ctrl+A - enter command mode
+                enter_command_mode();
+                return;
             }
-            break;
+        } else {
+            // Reset Control counter for any other key
+            mux.ctrl_count = 0;
+        }
+        
+        // Send input to active terminal (skip if it was our trigger key)
+        if (active->master_fd >= 0 && ch != CTRL_KEY('a')) {
+            if (ch == '\n' || ch == '\r') {
+                write(active->master_fd, "\r", 1);
+            } else if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+                write(active->master_fd, "\b", 1);
+            } else if (ch == KEY_LEFT) {
+                write(active->master_fd, "\033[D", 3);
+            } else if (ch == KEY_RIGHT) {
+                write(active->master_fd, "\033[C", 3);
+            } else if (ch == KEY_UP) {
+                write(active->master_fd, "\033[A", 3);
+            } else if (ch == KEY_DOWN) {
+                write(active->master_fd, "\033[B", 3);
+            } else if (ch >= 1 && ch <= 26) {
+                // Control characters (including Ctrl+C)
+                char c = ch;
+                write(active->master_fd, &c, 1);
+            } else if (ch >= 32 && ch <= 126) {
+                // Printable characters
+                char c = ch;
+                write(active->master_fd, &c, 1);
+            }
+        }
     }
 }
 
@@ -352,6 +511,8 @@ void init_multiplexer() {
     // Initialize multiplexer structure
     memset(&mux, 0, sizeof(multiplexer_t));
     mux.should_quit = 0;
+    mux.mode = MODE_NORMAL;
+    mux.ctrl_count = 0;
     
     // Initialize ncurses
     initscr();
@@ -507,9 +668,16 @@ int main() {
         }
         
         // Status line
-        mvprintw(mux.screen_height - 1, 0, 
-                "Active: %d | Tab: switch | q/ESC/Ctrl+C: quit", 
-                mux.active_panel + 1);
+        if (mux.mode == MODE_COMMAND) {
+            wattron(stdscr, A_REVERSE);
+            mvprintw(mux.screen_height - 1, 0, 
+                    " COMMAND MODE | q:quit | n/tab:next | p:prev | 1-4:panel | a:send Ctrl+A | ESC:cancel ");
+            wattroff(stdscr, A_REVERSE);
+        } else {
+            mvprintw(mux.screen_height - 1, 0, 
+                    "Panel: %d | Ctrl+A Ctrl+A: command mode", 
+                    mux.active_panel + 1);
+        }
         clrtoeol();
         refresh();
     }
