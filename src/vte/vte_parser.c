@@ -1,6 +1,143 @@
 #include "vte_parser.h"
 #include <string.h>
 #include <stdlib.h>
+#include <ncurses.h>
+
+// UTF-8 utilities
+bool vte_is_utf8_continuation(uint8_t byte) {
+    return (byte & 0xC0) == 0x80;
+}
+
+size_t vte_utf8_char_len(uint8_t first_byte) {
+    if ((first_byte & 0x80) == 0) return 1;
+    if ((first_byte & 0xE0) == 0xC0) return 2;
+    if ((first_byte & 0xF0) == 0xE0) return 3;
+    if ((first_byte & 0xF8) == 0xF0) return 4;
+    return 0; // Invalid
+}
+
+uint32_t vte_utf8_decode(const uint8_t *bytes, size_t len) {
+    if (len == 0) return 0;
+    
+    uint8_t first = bytes[0];
+    if ((first & 0x80) == 0) {
+        return first;
+    }
+    
+    if (len < 2 || (first & 0xE0) == 0xC0) {
+        if (len >= 2) {
+            return ((first & 0x1F) << 6) | (bytes[1] & 0x3F);
+        }
+        return 0xFFFD; // Replacement character
+    }
+    
+    if (len < 3 || (first & 0xF0) == 0xE0) {
+        if (len >= 3) {
+            return ((first & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+        }
+        return 0xFFFD;
+    }
+    
+    if (len < 4 || (first & 0xF8) == 0xF0) {
+        if (len >= 4) {
+            return ((first & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) | 
+                   ((bytes[2] & 0x3F) << 6) | (bytes[3] & 0x3F);
+        }
+        return 0xFFFD;
+    }
+    
+    return 0xFFFD;
+}
+
+// Parameter utilities
+void vte_params_init(vte_params_t *params) {
+    memset(params, 0, sizeof(vte_params_t));
+}
+
+void vte_params_clear(vte_params_t *params) {
+    params->len = 0;
+    params->current_subparams = 0;
+    memset(params->subparams, 0, sizeof(params->subparams));
+}
+
+void vte_params_push(vte_params_t *params, uint16_t value) {
+    if (params->len >= VTE_MAX_PARAMS) return;
+    
+    // Finalize current parameter if we have subparams
+    if (params->current_subparams > 0) {
+        size_t param_start = params->len - params->current_subparams;
+        params->subparams[param_start] = params->current_subparams;
+    }
+    
+    // Add new parameter
+    params->params[params->len] = value;
+    params->subparams[params->len] = 1; // This parameter has 1 value
+    params->current_subparams = 0;
+    params->len++;
+}
+
+void vte_params_extend(vte_params_t *params, uint16_t value) {
+    if (params->len >= VTE_MAX_PARAMS) return;
+    
+    // Add subparameter
+    params->params[params->len] = value;
+    params->current_subparams++;
+    params->len++;
+    
+    // Update count for the current parameter
+    if (params->len > params->current_subparams) {
+        size_t param_start = params->len - params->current_subparams - 1;
+        params->subparams[param_start] = params->current_subparams + 1;
+    }
+}
+
+bool vte_params_is_full(const vte_params_t *params) {
+    return params->len >= VTE_MAX_PARAMS;
+}
+
+size_t vte_params_len(const vte_params_t *params) {
+    // Count actual parameters (not subparameters)
+    size_t count = 0;
+    size_t pos = 0;
+    
+    while (pos < params->len) {
+        size_t subparams = params->subparams[pos];
+        if (subparams == 0) subparams = 1;
+        pos += subparams;
+        count++;
+    }
+    
+    return count;
+}
+
+const uint16_t *vte_params_get(const vte_params_t *params, size_t index, size_t *subparam_count) {
+    size_t current_param = 0;
+    size_t pos = 0;
+    
+    // Find the start of the requested parameter
+    while (pos < params->len && current_param < index) {
+        size_t subparams = params->subparams[pos];
+        if (subparams == 0) subparams = 1;
+        pos += subparams;
+        current_param++;
+    }
+    
+    if (pos >= params->len || current_param != index) {
+        *subparam_count = 0;
+        return NULL;
+    }
+    
+    *subparam_count = params->subparams[pos];
+    if (*subparam_count == 0) *subparam_count = 1;
+    
+    return &params->params[pos];
+}
+
+uint16_t vte_params_get_single(const vte_params_t *params, size_t index, uint16_t default_val) {
+    size_t subparam_count;
+    const uint16_t *param = vte_params_get(params, index, &subparam_count);
+    return param ? param[0] : default_val;
+}
 
 // Color mapping
 int ansi_to_ncurses_color(int ansi_color) {
@@ -13,271 +150,440 @@ int ansi_to_ncurses_color(int ansi_color) {
         case 5: return COLOR_MAGENTA;
         case 6: return COLOR_CYAN;
         case 7: return COLOR_WHITE;
-        default: return -1; // Default color
+        default: return -1;
     }
 }
 
+// Parser initialization
 void vte_parser_init(vte_parser_t *parser) {
     memset(parser, 0, sizeof(vte_parser_t));
     parser->state = VTE_STATE_GROUND;
-    parser->fg_color = -1; // Default foreground
-    parser->bg_color = -1; // Default background
-    parser->attrs = A_NORMAL;
+    vte_params_init(&parser->params);
 }
 
+// Internal helper functions
 static void vte_reset_params(vte_parser_t *parser) {
-    parser->param_count = 0;
+    parser->intermediate_idx = 0;
+    parser->ignoring = false;
     parser->current_param = 0;
-    parser->intermediate_count = 0;
-    memset(parser->params, 0, sizeof(parser->params));
-    memset(parser->intermediate, 0, sizeof(parser->intermediate));
+    vte_params_clear(&parser->params);
 }
 
-static int vte_get_param(vte_parser_t *parser, int index, int default_val) {
-    if (index >= parser->param_count || parser->params[index][0] == '\0') {
-        return default_val;
+static void vte_action_collect(vte_parser_t *parser, uint8_t byte) {
+    if (parser->intermediate_idx >= VTE_MAX_INTERMEDIATES) {
+        parser->ignoring = true;
+    } else {
+        parser->intermediates[parser->intermediate_idx++] = byte;
     }
-    return atoi(parser->params[index]);
 }
 
-static void vte_handle_csi(terminal_panel_t *panel, char final_char) {
-    vte_parser_t *parser = &panel->parser;
+static void vte_action_param(vte_parser_t *parser) {
+    if (vte_params_is_full(&parser->params)) {
+        parser->ignoring = true;
+    } else {
+        vte_params_push(&parser->params, parser->current_param);
+        parser->current_param = 0;
+    }
+}
+
+static void vte_action_subparam(vte_parser_t *parser) {
+    if (vte_params_is_full(&parser->params)) {
+        parser->ignoring = true;
+    } else {
+        vte_params_extend(&parser->params, parser->current_param);
+        parser->current_param = 0;
+    }
+}
+
+static void vte_action_paramnext(vte_parser_t *parser, uint8_t byte) {
+    if (vte_params_is_full(&parser->params)) {
+        parser->ignoring = true;
+    } else {
+        uint16_t digit = byte - '0';
+        if (parser->current_param <= (UINT16_MAX - digit) / 10) {
+            parser->current_param = parser->current_param * 10 + digit;
+        } else {
+            parser->current_param = UINT16_MAX;
+        }
+    }
+}
+
+static void vte_action_csi_dispatch(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    if (!vte_params_is_full(&parser->params)) {
+        vte_params_push(&parser->params, parser->current_param);
+    }
     
-    switch (final_char) {
-        case 'm': { // SGR - Select Graphic Rendition
-            if (parser->param_count == 0) {
-                // Reset to defaults
-                parser->fg_color = -1;
-                parser->bg_color = -1;
-                parser->attrs = A_NORMAL;
-                break;
+    if (panel->perform.csi_dispatch) {
+        panel->perform.csi_dispatch(panel, &parser->params, parser->intermediates,
+                                   parser->intermediate_idx, parser->ignoring, (char)byte);
+    }
+    
+    parser->state = VTE_STATE_GROUND;
+}
+
+static void vte_action_esc_dispatch(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    if (panel->perform.esc_dispatch) {
+        panel->perform.esc_dispatch(panel, parser->intermediates, parser->intermediate_idx,
+                                   parser->ignoring, byte);
+    }
+    
+    parser->state = VTE_STATE_GROUND;
+}
+
+static void vte_action_hook(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    if (!vte_params_is_full(&parser->params)) {
+        vte_params_push(&parser->params, parser->current_param);
+    }
+    
+    if (panel->perform.hook) {
+        panel->perform.hook(panel, &parser->params, parser->intermediates,
+                           parser->intermediate_idx, parser->ignoring, (char)byte);
+    }
+    
+    parser->state = VTE_STATE_DCS_PASSTHROUGH;
+}
+
+static void vte_action_osc_put(vte_parser_t *parser, uint8_t byte) {
+    if (parser->osc_raw_len < VTE_MAX_OSC_RAW) {
+        parser->osc_raw[parser->osc_raw_len++] = byte;
+    }
+}
+
+static void vte_action_osc_put_param(vte_parser_t *parser) {
+    if (parser->osc_num_params >= VTE_MAX_OSC_PARAMS) return;
+    
+    size_t idx = parser->osc_raw_len;
+    
+    if (parser->osc_num_params == 0) {
+        parser->osc_params[0].start = 0;
+        parser->osc_params[0].end = idx;
+    } else {
+        size_t prev_end = parser->osc_params[parser->osc_num_params - 1].end;
+        parser->osc_params[parser->osc_num_params].start = prev_end;
+        parser->osc_params[parser->osc_num_params].end = idx;
+    }
+    
+    parser->osc_num_params++;
+}
+
+static void vte_osc_end(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    vte_action_osc_put_param(parser);
+    
+    if (panel->perform.osc_dispatch && parser->osc_num_params > 0) {
+        const uint8_t *params[VTE_MAX_OSC_PARAMS];
+        size_t param_lens[VTE_MAX_OSC_PARAMS];
+        
+        for (size_t i = 0; i < parser->osc_num_params; i++) {
+            params[i] = &parser->osc_raw[parser->osc_params[i].start];
+            param_lens[i] = parser->osc_params[i].end - parser->osc_params[i].start;
+        }
+        
+        panel->perform.osc_dispatch(panel, params, param_lens, parser->osc_num_params,
+                                   byte == 0x07);
+    }
+    
+    parser->osc_raw_len = 0;
+    parser->osc_num_params = 0;
+}
+
+static void vte_anywhere(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    switch (byte) {
+        case 0x18:
+        case 0x1A:
+            if (panel->perform.execute) {
+                panel->perform.execute(panel, byte);
+            }
+            parser->state = VTE_STATE_GROUND;
+            break;
+        case 0x1B:
+            vte_reset_params(parser);
+            parser->state = VTE_STATE_ESCAPE;
+            break;
+    }
+}
+
+// State machine implementation
+static void vte_advance_ground(vte_parser_t *parser, terminal_panel_t *panel, 
+                              const uint8_t *bytes, size_t len, size_t *processed) {
+    size_t i = 0;
+    
+    while (i < len) {
+        uint8_t byte = bytes[i];
+        
+        if (byte == 0x1B) {
+            vte_reset_params(parser);
+            parser->state = VTE_STATE_ESCAPE;
+            *processed = i + 1;
+            return;
+        }
+        
+        // Handle UTF-8 sequences
+        if (byte >= 0x80) {
+            size_t char_len = vte_utf8_char_len(byte);
+            if (char_len == 0 || i + char_len > len) {
+                // Invalid or incomplete UTF-8
+                if (panel->perform.print) {
+                    panel->perform.print(panel, 0xFFFD); // Replacement character
+                }
+                i++;
+                continue;
             }
             
-            for (int i = 0; i < parser->param_count; i++) {
-                int param = vte_get_param(parser, i, 0);
-                
-                switch (param) {
-                    case 0: // Reset
-                        parser->fg_color = -1;
-                        parser->bg_color = -1;
-                        parser->attrs = A_NORMAL;
-                        break;
-                    case 1: // Bold
-                        parser->attrs |= A_BOLD;
-                        break;
-                    case 4: // Underline
-                        parser->attrs |= A_UNDERLINE;
-                        break;
-                    case 7: // Reverse
-                        parser->attrs |= A_REVERSE;
-                        break;
-                    case 22: // Normal intensity
-                        parser->attrs &= ~A_BOLD;
-                        break;
-                    case 24: // No underline
-                        parser->attrs &= ~A_UNDERLINE;
-                        break;
-                    case 27: // No reverse
-                        parser->attrs &= ~A_REVERSE;
-                        break;
-                    default:
-                        if (param >= 30 && param <= 37) {
-                            parser->fg_color = ansi_to_ncurses_color(param - 30);
-                        } else if (param >= 40 && param <= 47) {
-                            parser->bg_color = ansi_to_ncurses_color(param - 40);
-                        } else if (param >= 90 && param <= 97) {
-                            parser->fg_color = ansi_to_ncurses_color(param - 90);
-                            parser->attrs |= A_BOLD;
-                        } else if (param >= 100 && param <= 107) {
-                            parser->bg_color = ansi_to_ncurses_color(param - 100);
-                        }
-                        break;
-                }
+            uint32_t codepoint = vte_utf8_decode(&bytes[i], char_len);
+            if (panel->perform.print) {
+                panel->perform.print(panel, codepoint);
             }
-            break;
-        }
-        case 'H': // CUP - Cursor Position
-        case 'f': { // HVP - Horizontal and Vertical Position
-            int row = vte_get_param(parser, 0, 1) - 1;
-            int col = vte_get_param(parser, 1, 1) - 1;
-            
-            if (row >= 0 && row < panel->screen_height) {
-                panel->cursor_y = row;
+            i += char_len;
+        } else if (byte >= 0x20 && byte <= 0x7E) {
+            // Printable ASCII
+            if (panel->perform.print) {
+                panel->perform.print(panel, byte);
             }
-            if (col >= 0 && col < panel->screen_width) {
-                panel->cursor_x = col;
+            i++;
+        } else {
+            // Control characters
+            if (panel->perform.execute) {
+                panel->perform.execute(panel, byte);
             }
-            break;
-        }
-        case 'A': { // CUU - Cursor Up
-            int count = vte_get_param(parser, 0, 1);
-            panel->cursor_y = (panel->cursor_y - count < 0) ? 0 : panel->cursor_y - count;
-            break;
-        }
-        case 'B': { // CUD - Cursor Down
-            int count = vte_get_param(parser, 0, 1);
-            panel->cursor_y = (panel->cursor_y + count >= panel->screen_height) ? 
-                             panel->screen_height - 1 : panel->cursor_y + count;
-            break;
-        }
-        case 'C': { // CUF - Cursor Forward
-            int count = vte_get_param(parser, 0, 1);
-            panel->cursor_x = (panel->cursor_x + count >= panel->screen_width) ? 
-                             panel->screen_width - 1 : panel->cursor_x + count;
-            break;
-        }
-        case 'D': { // CUB - Cursor Back
-            int count = vte_get_param(parser, 0, 1);
-            panel->cursor_x = (panel->cursor_x - count < 0) ? 0 : panel->cursor_x - count;
-            break;
-        }
-        case 'J': { // ED - Erase in Display
-            int param = vte_get_param(parser, 0, 0);
-            if (param == 2) { // Clear entire screen
-                for (int y = 0; y < panel->screen_height; y++) {
-                    for (int x = 0; x < panel->screen_width; x++) {
-                        panel->screen[y][x].ch = ' ';
-                        panel->screen[y][x].fg_color = -1;
-                        panel->screen[y][x].bg_color = -1;
-                        panel->screen[y][x].attrs = A_NORMAL;
-                    }
-                }
-            }
-            break;
-        }
-        case 'K': { // EL - Erase in Line
-            int param = vte_get_param(parser, 0, 0);
-            if (param == 0) { // Clear from cursor to end of line
-                for (int x = panel->cursor_x; x < panel->screen_width; x++) {
-                    panel->screen[panel->cursor_y][x].ch = ' ';
-                    panel->screen[panel->cursor_y][x].fg_color = -1;
-                    panel->screen[panel->cursor_y][x].bg_color = -1;
-                    panel->screen[panel->cursor_y][x].attrs = A_NORMAL;
-                }
-            }
-            break;
+            i++;
         }
     }
-}
-
-static void vte_put_char(terminal_panel_t *panel, char ch) {
-    if (panel->cursor_y >= 0 && panel->cursor_y < panel->screen_height &&
-        panel->cursor_x >= 0 && panel->cursor_x < panel->screen_width) {
-        
-        terminal_cell_t *cell = &panel->screen[panel->cursor_y][panel->cursor_x];
-        cell->ch = ch;
-        cell->fg_color = panel->parser.fg_color;
-        cell->bg_color = panel->parser.bg_color;
-        cell->attrs = panel->parser.attrs;
-        
-        panel->cursor_x++;
-        if (panel->cursor_x >= panel->screen_width) {
-            panel->cursor_x = 0;
-            panel->cursor_y++;
-            if (panel->cursor_y >= panel->screen_height) {
-                // Scroll up
-                for (int y = 0; y < panel->screen_height - 1; y++) {
-                    memcpy(panel->screen[y], panel->screen[y + 1], 
-                           panel->screen_width * sizeof(terminal_cell_t));
-                }
-                // Clear last line
-                for (int x = 0; x < panel->screen_width; x++) {
-                    panel->screen[panel->screen_height - 1][x].ch = ' ';
-                    panel->screen[panel->screen_height - 1][x].fg_color = -1;
-                    panel->screen[panel->screen_height - 1][x].bg_color = -1;
-                    panel->screen[panel->screen_height - 1][x].attrs = A_NORMAL;
-                }
-                panel->cursor_y = panel->screen_height - 1;
-            }
-        }
-    }
-}
-
-void vte_parser_feed(terminal_panel_t *panel, const char *data, size_t len) {
-    vte_parser_t *parser = &panel->parser;
     
-    for (size_t i = 0; i < len; i++) {
-        unsigned char ch = data[i];
-        
-        switch (parser->state) {
-            case VTE_STATE_GROUND:
-                if (ch == '\033') {
-                    parser->state = VTE_STATE_ESCAPE;
-                } else if (ch == '\n') {
-                    panel->cursor_x = 0;
-                    panel->cursor_y++;
-                    if (panel->cursor_y >= panel->screen_height) {
-                        // Scroll up
-                        for (int y = 0; y < panel->screen_height - 1; y++) {
-                            memcpy(panel->screen[y], panel->screen[y + 1], 
-                                   panel->screen_width * sizeof(terminal_cell_t));
-                        }
-                        // Clear last line
-                        for (int x = 0; x < panel->screen_width; x++) {
-                            panel->screen[panel->screen_height - 1][x].ch = ' ';
-                            panel->screen[panel->screen_height - 1][x].fg_color = -1;
-                            panel->screen[panel->screen_height - 1][x].bg_color = -1;
-                            panel->screen[panel->screen_height - 1][x].attrs = A_NORMAL;
-                        }
-                        panel->cursor_y = panel->screen_height - 1;
-                    }
-                } else if (ch == '\r') {
-                    panel->cursor_x = 0;
-                } else if (ch == '\b') {
-                    if (panel->cursor_x > 0) {
-                        panel->cursor_x--;
-                    }
-                } else if (ch >= 32 && ch <= 126) {
-                    vte_put_char(panel, ch);
-                }
-                break;
-                
-            case VTE_STATE_ESCAPE:
-                if (ch == '[') {
-                    parser->state = VTE_STATE_CSI_ENTRY;
-                    vte_reset_params(parser);
-                } else {
-                    parser->state = VTE_STATE_GROUND;
-                }
-                break;
-                
-            case VTE_STATE_CSI_ENTRY:
-                if (ch >= '0' && ch <= '9') {
-                    parser->state = VTE_STATE_CSI_PARAM;
-                    parser->params[0][0] = ch;
-                    parser->params[0][1] = '\0';
-                    parser->param_count = 1;
-                } else if (ch >= 0x40 && ch <= 0x7E) {
-                    vte_handle_csi(panel, ch);
-                    parser->state = VTE_STATE_GROUND;
-                } else {
-                    parser->state = VTE_STATE_GROUND;
-                }
-                break;
-                
-            case VTE_STATE_CSI_PARAM:
-                if (ch >= '0' && ch <= '9') {
-                    int len = strlen(parser->params[parser->param_count - 1]);
-                    if (len < 15) {
-                        parser->params[parser->param_count - 1][len] = ch;
-                        parser->params[parser->param_count - 1][len + 1] = '\0';
-                    }
-                } else if (ch == ';') {
-                    if (parser->param_count < MAX_PARAMS) {
-                        parser->param_count++;
-                        parser->params[parser->param_count - 1][0] = '\0';
-                    }
-                } else if (ch >= 0x40 && ch <= 0x7E) {
-                    vte_handle_csi(panel, ch);
-                    parser->state = VTE_STATE_GROUND;
-                } else {
-                    parser->state = VTE_STATE_GROUND;
-                }
-                break;
-                
-            default:
-                parser->state = VTE_STATE_GROUND;
-                break;
+    *processed = len;
+}
+
+static void vte_advance_escape(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    switch (byte) {
+        case 0x00 ... 0x17:
+        case 0x19:
+        case 0x1C ... 0x1F:
+            if (panel->perform.execute) {
+                panel->perform.execute(panel, byte);
+            }
+            break;
+        case 0x20 ... 0x2F:
+            vte_action_collect(parser, byte);
+            parser->state = VTE_STATE_ESCAPE_INTERMEDIATE;
+            break;
+        case 0x30 ... 0x4F:
+        case 0x51 ... 0x57:
+        case 0x59 ... 0x5A:
+        case 0x5C:
+        case 0x60 ... 0x7E:
+            vte_action_esc_dispatch(parser, panel, byte);
+            break;
+        case 0x50:
+            vte_reset_params(parser);
+            parser->state = VTE_STATE_DCS_ENTRY;
+            break;
+        case 0x58:
+        case 0x5E:
+        case 0x5F:
+            parser->state = VTE_STATE_SOS_PM_APC_STRING;
+            break;
+        case 0x5B:
+            vte_reset_params(parser);
+            parser->state = VTE_STATE_CSI_ENTRY;
+            break;
+        case 0x5D:
+            parser->osc_raw_len = 0;
+            parser->osc_num_params = 0;
+            parser->state = VTE_STATE_OSC_STRING;
+            break;
+        default:
+            vte_anywhere(parser, panel, byte);
+            break;
+    }
+}
+
+static void vte_advance_csi_entry(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    switch (byte) {
+        case 0x00 ... 0x17:
+        case 0x19:
+        case 0x1C ... 0x1F:
+            if (panel->perform.execute) {
+                panel->perform.execute(panel, byte);
+            }
+            break;
+        case 0x20 ... 0x2F:
+            vte_action_collect(parser, byte);
+            parser->state = VTE_STATE_CSI_INTERMEDIATE;
+            break;
+        case 0x30 ... 0x39:
+            vte_action_paramnext(parser, byte);
+            parser->state = VTE_STATE_CSI_PARAM;
+            break;
+        case 0x3A:
+            vte_action_subparam(parser);
+            parser->state = VTE_STATE_CSI_PARAM;
+            break;
+        case 0x3B:
+            vte_action_param(parser);
+            parser->state = VTE_STATE_CSI_PARAM;
+            break;
+        case 0x3C ... 0x3F:
+            vte_action_collect(parser, byte);
+            parser->state = VTE_STATE_CSI_PARAM;
+            break;
+        case 0x40 ... 0x7E:
+            vte_action_csi_dispatch(parser, panel, byte);
+            break;
+        default:
+            vte_anywhere(parser, panel, byte);
+            break;
+    }
+}
+
+static void vte_advance_csi_param(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    switch (byte) {
+        case 0x00 ... 0x17:
+        case 0x19:
+        case 0x1C ... 0x1F:
+            if (panel->perform.execute) {
+                panel->perform.execute(panel, byte);
+            }
+            break;
+        case 0x20 ... 0x2F:
+            vte_action_collect(parser, byte);
+            parser->state = VTE_STATE_CSI_INTERMEDIATE;
+            break;
+        case 0x30 ... 0x39:
+            vte_action_paramnext(parser, byte);
+            break;
+        case 0x3A:
+            vte_action_subparam(parser);
+            break;
+        case 0x3B:
+            vte_action_param(parser);
+            break;
+        case 0x3C ... 0x3F:
+            parser->state = VTE_STATE_CSI_IGNORE;
+            break;
+        case 0x40 ... 0x7E:
+            vte_action_csi_dispatch(parser, panel, byte);
+            break;
+        case 0x7F:
+            break;
+        default:
+            vte_anywhere(parser, panel, byte);
+            break;
+    }
+}
+
+static void vte_advance_osc_string(vte_parser_t *parser, terminal_panel_t *panel, uint8_t byte) {
+    switch (byte) {
+        case 0x00 ... 0x06:
+        case 0x08 ... 0x17:
+        case 0x19:
+        case 0x1C ... 0x1F:
+            break;
+        case 0x07:
+            vte_osc_end(parser, panel, byte);
+            parser->state = VTE_STATE_GROUND;
+            break;
+        case 0x18:
+        case 0x1A:
+            vte_osc_end(parser, panel, byte);
+            if (panel->perform.execute) {
+                panel->perform.execute(panel, byte);
+            }
+            parser->state = VTE_STATE_GROUND;
+            break;
+        case 0x1B:
+            vte_osc_end(parser, panel, byte);
+            vte_reset_params(parser);
+            parser->state = VTE_STATE_ESCAPE;
+            break;
+        case 0x3B:
+            vte_action_osc_put_param(parser);
+            break;
+        default:
+            vte_action_osc_put(parser, byte);
+            break;
+    }
+}
+
+// Main parser advance function
+void vte_parser_advance(vte_parser_t *parser, terminal_panel_t *panel, 
+                       const uint8_t *data, size_t len) {
+    size_t i = 0;
+    
+    while (i < len) {
+        if (parser->state == VTE_STATE_GROUND) {
+            size_t processed = 0;
+            vte_advance_ground(parser, panel, &data[i], len - i, &processed);
+            i += processed;
+        } else {
+            uint8_t byte = data[i];
+            
+            switch (parser->state) {
+                case VTE_STATE_ESCAPE:
+                    vte_advance_escape(parser, panel, byte);
+                    break;
+                case VTE_STATE_CSI_ENTRY:
+                    vte_advance_csi_entry(parser, panel, byte);
+                    break;
+                case VTE_STATE_CSI_PARAM:
+                    vte_advance_csi_param(parser, panel, byte);
+                    break;
+                case VTE_STATE_OSC_STRING:
+                    vte_advance_osc_string(parser, panel, byte);
+                    break;
+                default:
+                    vte_anywhere(parser, panel, byte);
+                    break;
+            }
+            i++;
         }
     }
 }
+
+// Default perform implementation stubs
+static void default_print(terminal_panel_t *panel, uint32_t codepoint) {
+    // Default implementation - could be overridden
+}
+
+static void default_execute(terminal_panel_t *panel, uint8_t byte) {
+    // Default implementation - could be overridden
+}
+
+static void default_csi_dispatch(terminal_panel_t *panel, const vte_params_t *params,
+                                const uint8_t *intermediates, size_t intermediate_len,
+                                bool ignore, char action) {
+    // Default implementation - could be overridden
+}
+
+static void default_esc_dispatch(terminal_panel_t *panel, const uint8_t *intermediates,
+                                size_t intermediate_len, bool ignore, uint8_t byte) {
+    // Default implementation - could be overridden
+}
+
+static void default_osc_dispatch(terminal_panel_t *panel, const uint8_t *const *params,
+                                const size_t *param_lens, size_t num_params, bool bell_terminated) {
+    // Default implementation - could be overridden
+}
+
+static void default_hook(terminal_panel_t *panel, const vte_params_t *params,
+                        const uint8_t *intermediates, size_t intermediate_len,
+                        bool ignore, char action) {
+    // Default implementation - could be overridden
+}
+
+static void default_put(terminal_panel_t *panel, uint8_t byte) {
+    // Default implementation - could be overridden
+}
+
+static void default_unhook(terminal_panel_t *panel) {
+    // Default implementation - could be overridden
+}
+
+const vte_perform_t vte_default_perform = {
+    .print = default_print,
+    .execute = default_execute,
+    .csi_dispatch = default_csi_dispatch,
+    .esc_dispatch = default_esc_dispatch,
+    .osc_dispatch = default_osc_dispatch,
+    .hook = default_hook,
+    .put = default_put,
+    .unhook = default_unhook
+};

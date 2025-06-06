@@ -4,16 +4,22 @@ LIBS = -lncurses -lutil
 TARGET = toad
 SRCDIR = src
 VTEDIR = $(SRCDIR)/vte
+TESTDIR = tests
 
 # Source files
 MAIN_SOURCES = $(SRCDIR)/main.c
-VTE_SOURCES = $(VTEDIR)/vte_parser.c
+VTE_SOURCES = $(VTEDIR)/vte_parser.c $(VTEDIR)/vte_terminal.c
 SOURCES = $(MAIN_SOURCES) $(VTE_SOURCES)
 
 # Object files
 MAIN_OBJECTS = $(MAIN_SOURCES:.c=.o)
 VTE_OBJECTS = $(VTE_SOURCES:.c=.o)
 OBJECTS = $(MAIN_OBJECTS) $(VTE_OBJECTS)
+
+# Test files
+TEST_SOURCES = $(TESTDIR)/test_vte.c
+TEST_TARGET = $(TESTDIR)/test_vte
+TEST_OBJECTS = $(TEST_SOURCES:.c=.o)
 
 # Default target
 all: $(TARGET)
@@ -30,6 +36,19 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 $(VTEDIR)/%.o: $(VTEDIR)/%.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Compile test source
+$(TESTDIR)/%.o: $(TESTDIR)/%.c
+	$(CC) $(CFLAGS) -I$(SRCDIR) -c $< -o $@
+
+# Build and run tests
+test: $(TEST_TARGET)
+	@echo "Running VTE parser tests..."
+	@./$(TEST_TARGET)
+
+# Build test executable
+$(TEST_TARGET): $(TEST_OBJECTS) $(VTE_OBJECTS)
+	$(CC) $(CFLAGS) -I$(SRCDIR) -o $(TEST_TARGET) $(TEST_OBJECTS) $(VTE_OBJECTS)
+
 # Debug build
 debug: CFLAGS += -g -DDEBUG
 debug: $(TARGET)
@@ -44,7 +63,7 @@ run: $(TARGET)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET) $(OBJECTS)
+	rm -f $(TARGET) $(OBJECTS) $(TEST_TARGET) $(TEST_OBJECTS)
 
 # Install dependencies (macOS)
 install-deps:
@@ -55,4 +74,4 @@ install-deps:
 		echo "Please install ncurses manually"; \
 	fi
 
-.PHONY: all debug release run clean install-deps
+.PHONY: all debug release run clean install-deps test

@@ -55,7 +55,7 @@ void init_panel_screen(terminal_panel_t *panel) {
         
         // Initialize cells
         for (int x = 0; x < panel->screen_width; x++) {
-            panel->screen[y][x].ch = ' ';
+            panel->screen[y][x].codepoint = ' ';
             panel->screen[y][x].fg_color = -1;
             panel->screen[y][x].bg_color = -1;
             panel->screen[y][x].attrs = A_NORMAL;
@@ -65,7 +65,12 @@ void init_panel_screen(terminal_panel_t *panel) {
     panel->cursor_x = 0;
     panel->cursor_y = 0;
     
+    // Initialize VTE parser and set up terminal perform implementation
     vte_parser_init(&panel->parser);
+    panel->perform = terminal_perform;
+    panel->fg_color = -1;
+    panel->bg_color = -1;
+    panel->attrs = A_NORMAL;
 }
 
 void free_panel_screen(terminal_panel_t *panel) {
@@ -186,25 +191,36 @@ void draw_panel(terminal_panel_t *panel) {
         for (int x = 0; x < panel->screen_width; x++) {
             terminal_cell_t *cell = &panel->screen[y][x];
             
-            if (cell->ch != ' ' || cell->bg_color != -1) {
+            // Only draw non-space characters or characters with background colors
+            if (cell->codepoint != ' ' || cell->bg_color != -1 || cell->attrs != A_NORMAL) {
                 // Calculate color pair
                 int color_pair = 0;
                 if (cell->fg_color != -1 || cell->bg_color != -1) {
                     int fg = (cell->fg_color == -1) ? -1 : cell->fg_color;
                     int bg = (cell->bg_color == -1) ? -1 : cell->bg_color;
                     
-                    // Find or create color pair
+                    // Find existing color pair or create new one
+                    bool found = false;
                     for (int i = 1; i < COLOR_PAIRS && i < 64; i++) {
                         short pair_fg, pair_bg;
                         pair_content(i, &pair_fg, &pair_bg);
                         if (pair_fg == fg && pair_bg == bg) {
                             color_pair = i;
+                            found = true;
                             break;
                         }
-                        if (pair_fg == 0 && pair_bg == 0) {
-                            init_pair(i, fg, bg);
-                            color_pair = i;
-                            break;
+                    }
+                    
+                    // If not found, create new pair
+                    if (!found) {
+                        for (int i = 16; i < COLOR_PAIRS && i < 64; i++) { // Start from 16 to avoid conflicts
+                            short pair_fg, pair_bg;
+                            pair_content(i, &pair_fg, &pair_bg);
+                            if (pair_fg == 0 && pair_bg == 0) { // Uninitialized pair
+                                init_pair(i, fg, bg);
+                                color_pair = i;
+                                break;
+                            }
                         }
                     }
                 }
@@ -217,14 +233,42 @@ void draw_panel(terminal_panel_t *panel) {
                     wattron(panel->win, COLOR_PAIR(color_pair));
                 }
                 
-                mvwaddch(panel->win, y + 1, x + 1, cell->ch);
+                // Handle Unicode codepoints
+                if (cell->codepoint <= 0x7F) {
+                    // ASCII character
+                    mvwaddch(panel->win, y + 1, x + 1, (chtype)cell->codepoint);
+                } else {
+                    // Unicode character - convert to UTF-8 and print
+                    char utf8_buf[5] = {0};
+                    if (cell->codepoint <= 0x7FF) {
+                        utf8_buf[0] = 0xC0 | (cell->codepoint >> 6);
+                        utf8_buf[1] = 0x80 | (cell->codepoint & 0x3F);
+                    } else if (cell->codepoint <= 0xFFFF) {
+                        utf8_buf[0] = 0xE0 | (cell->codepoint >> 12);
+                        utf8_buf[1] = 0x80 | ((cell->codepoint >> 6) & 0x3F);
+                        utf8_buf[2] = 0x80 | (cell->codepoint & 0x3F);
+                    } else if (cell->codepoint <= 0x10FFFF) {
+                        utf8_buf[0] = 0xF0 | (cell->codepoint >> 18);
+                        utf8_buf[1] = 0x80 | ((cell->codepoint >> 12) & 0x3F);
+                        utf8_buf[2] = 0x80 | ((cell->codepoint >> 6) & 0x3F);
+                        utf8_buf[3] = 0x80 | (cell->codepoint & 0x3F);
+                    } else {
+                        // Invalid codepoint, use replacement character
+                        utf8_buf[0] = '?';
+                    }
+                    mvwaddstr(panel->win, y + 1, x + 1, utf8_buf);
+                }
                 
+                // Remove attributes and colors
                 if (color_pair > 0) {
                     wattroff(panel->win, COLOR_PAIR(color_pair));
                 }
                 if (cell->attrs != A_NORMAL) {
                     wattroff(panel->win, cell->attrs);
                 }
+            } else {
+                // For spaces with default colors, just put a space
+                mvwaddch(panel->win, y + 1, x + 1, ' ');
             }
         }
     }
@@ -321,14 +365,15 @@ void init_multiplexer() {
         start_color();
         use_default_colors();
         
-        // Initialize basic color pairs
-        init_pair(1, COLOR_RED, -1);
-        init_pair(2, COLOR_GREEN, -1);
-        init_pair(3, COLOR_YELLOW, -1);
-        init_pair(4, COLOR_BLUE, -1);
-        init_pair(5, COLOR_MAGENTA, -1);
-        init_pair(6, COLOR_CYAN, -1);
-        init_pair(7, COLOR_WHITE, -1);
+        // Initialize basic color pairs (starting from 8 to avoid conflicts)
+        init_pair(8, COLOR_RED, -1);
+        init_pair(9, COLOR_GREEN, -1);
+        init_pair(10, COLOR_YELLOW, -1);
+        init_pair(11, COLOR_BLUE, -1);
+        init_pair(12, COLOR_MAGENTA, -1);
+        init_pair(13, COLOR_CYAN, -1);
+        init_pair(14, COLOR_WHITE, -1);
+        init_pair(15, COLOR_BLACK, -1);
     }
     
     cbreak();
