@@ -14,7 +14,7 @@
 #include <ncurses.h>
 #include "vte/vte_parser.h"
 
-#define MAX_PANELS 4
+#define MAX_PANELS 8
 #define BUFFER_SIZE 1024
 #define CTRL_KEY(k) ((k) & 0x1f)
 
@@ -23,8 +23,16 @@ typedef enum {
     MODE_COMMAND    // Waiting for command key
 } input_mode_t;
 
+typedef enum {
+    PANEL_TYPE_MAIN,    // Full-screen main panel
+    PANEL_TYPE_OVERLAY  // Smaller overlay panel
+} panel_type_t;
+
 typedef struct {
     terminal_panel_t panels[MAX_PANELS];
+    panel_type_t panel_types[MAX_PANELS];
+    int panel_z_order[MAX_PANELS];  // Z-order for rendering (higher index = front)
+    bool panel_dirty[MAX_PANELS];   // Track which panels need redrawing
     int panel_count;
     int active_panel;
     int screen_width, screen_height;
@@ -33,6 +41,10 @@ typedef struct {
     // Input mode system
     input_mode_t mode;
     int ctrl_count;
+    
+    // Rendering optimization
+    bool force_full_redraw;
+    bool status_line_dirty;
 } multiplexer_t;
 
 static multiplexer_t mux;
@@ -41,6 +53,12 @@ static multiplexer_t mux;
 void cleanup_multiplexer(void);
 void enter_command_mode(void);
 void exit_command_mode(void);
+int create_overlay_panel(void);
+void bring_panel_to_front(int panel_index);
+void close_panel(int panel_index);
+void mark_panel_dirty(int panel_index);
+void mark_all_panels_dirty(void);
+void mark_status_dirty(void);
 
 void cleanup_and_exit(int sig) {
     (void)sig;
@@ -52,11 +70,30 @@ void cleanup_and_exit(int sig) {
 void enter_command_mode(void) {
     mux.mode = MODE_COMMAND;
     mux.ctrl_count = 0;
+    mark_status_dirty();
 }
 
 void exit_command_mode(void) {
     mux.mode = MODE_NORMAL;
     mux.ctrl_count = 0;
+    mark_status_dirty();
+}
+
+void mark_panel_dirty(int panel_index) {
+    if (panel_index >= 0 && panel_index < mux.panel_count) {
+        mux.panel_dirty[panel_index] = true;
+    }
+}
+
+void mark_all_panels_dirty(void) {
+    for (int i = 0; i < mux.panel_count; i++) {
+        mux.panel_dirty[i] = true;
+    }
+    mux.force_full_redraw = true;
+}
+
+void mark_status_dirty(void) {
+    mux.status_line_dirty = true;
 }
 
 void init_panel_screen(terminal_panel_t *panel) {
@@ -109,7 +146,7 @@ void free_panel_screen(terminal_panel_t *panel) {
     }
 }
 
-int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int height) {
+int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int height, panel_type_t type) {
     if (!panel) {
         return -1;
     }
@@ -191,23 +228,53 @@ int create_terminal_panel(terminal_panel_t *panel, int x, int y, int width, int 
     return 0;
 }
 
-void draw_panel(terminal_panel_t *panel) {
+void draw_panel(terminal_panel_t *panel, int panel_index) {
     if (!panel || !panel->active || !panel->win || !panel->screen) {
         return;
     }
     
     werase(panel->win);
-    box(panel->win, 0, 0);
     
-    // Draw title
-    if (panel == &mux.panels[mux.active_panel]) {
+    // Draw different styles based on panel type
+    panel_type_t type = mux.panel_types[panel_index];
+    
+    if (type == PANEL_TYPE_OVERLAY) {
+        // Overlay panels have a thicker border and shadow effect
         wattron(panel->win, A_BOLD);
-        mvwprintw(panel->win, 0, 2, " Terminal %d [ACTIVE] ", 
-                  (int)(panel - mux.panels));
+        box(panel->win, 0, 0);
+        wattroff(panel->win, A_BOLD);
+        
+        // Add shadow effect by drawing a simple border offset
+        if (panel->start_x + panel->width < mux.screen_width && 
+            panel->start_y + panel->height < mux.screen_height) {
+            // Draw shadow on right and bottom
+            for (int y = 1; y <= panel->height; y++) {
+                mvaddch(panel->start_y + y, panel->start_x + panel->width, ' ' | A_REVERSE);
+            }
+            for (int x = 1; x <= panel->width; x++) {
+                mvaddch(panel->start_y + panel->height, panel->start_x + x, ' ' | A_REVERSE);
+            }
+        }
+    } else {
+        // Main panels have normal borders
+        box(panel->win, 0, 0);
+    }
+    
+    // Draw title with panel type indicator
+    if (panel_index == mux.active_panel) {
+        wattron(panel->win, A_BOLD);
+        if (type == PANEL_TYPE_OVERLAY) {
+            mvwprintw(panel->win, 0, 2, " Overlay %d [ACTIVE] ", panel_index);
+        } else {
+            mvwprintw(panel->win, 0, 2, " Terminal %d [ACTIVE] ", panel_index);
+        }
         wattroff(panel->win, A_BOLD);
     } else {
-        mvwprintw(panel->win, 0, 2, " Terminal %d ", 
-                  (int)(panel - mux.panels));
+        if (type == PANEL_TYPE_OVERLAY) {
+            mvwprintw(panel->win, 0, 2, " Overlay %d ", panel_index);
+        } else {
+            mvwprintw(panel->win, 0, 2, " Terminal %d ", panel_index);
+        }
     }
     
     // Draw screen content
@@ -298,14 +365,14 @@ void draw_panel(terminal_panel_t *panel) {
     }
     
     // Highlight active panel border
-    if (panel == &mux.panels[mux.active_panel]) {
+    if (panel_index == mux.active_panel) {
         wattron(panel->win, A_BOLD);
         box(panel->win, 0, 0);
         wattroff(panel->win, A_BOLD);
     }
     
     // Draw cursor for active panel
-    if (panel == &mux.panels[mux.active_panel] && 
+    if (panel_index == mux.active_panel && 
         panel->cursor_y >= 0 && panel->cursor_y < panel->screen_height &&
         panel->cursor_x >= 0 && panel->cursor_x < panel->screen_width) {
         
@@ -370,7 +437,120 @@ void draw_panel(terminal_panel_t *panel) {
         }
     }
     
-    wrefresh(panel->win);
+    // Use wnoutrefresh instead of wrefresh to reduce flickering
+    // The actual refresh will happen once at the end of the main loop
+    wnoutrefresh(panel->win);
+}
+
+int create_overlay_panel(void) {
+    if (mux.panel_count >= MAX_PANELS) {
+        return -1; // No more panels available
+    }
+    
+    // Calculate overlay panel size and position (centered, 60% of screen size)
+    int overlay_width = (mux.screen_width * 3) / 5;
+    int overlay_height = (mux.screen_height * 3) / 5;
+    int overlay_x = (mux.screen_width - overlay_width) / 2;
+    int overlay_y = (mux.screen_height - overlay_height) / 2;
+    
+    // Ensure minimum size
+    if (overlay_width < 20) overlay_width = 20;
+    if (overlay_height < 10) overlay_height = 10;
+    
+    int panel_index = mux.panel_count;
+    
+    if (create_terminal_panel(&mux.panels[panel_index], overlay_x, overlay_y, 
+                             overlay_width, overlay_height, PANEL_TYPE_OVERLAY) == -1) {
+        return -1;
+    }
+    
+    // Set panel type and add to z-order
+    mux.panel_types[panel_index] = PANEL_TYPE_OVERLAY;
+    mux.panel_z_order[panel_index] = panel_index; // Higher index = front
+    mux.panel_count++;
+    
+    // Bring new panel to front and make it active
+    bring_panel_to_front(panel_index);
+    mux.active_panel = panel_index;
+    
+    return panel_index;
+}
+
+void bring_panel_to_front(int panel_index) {
+    if (panel_index < 0 || panel_index >= mux.panel_count) {
+        return;
+    }
+    
+    // Find current z-order position
+    int current_z = mux.panel_z_order[panel_index];
+    
+    // Move all panels with higher z-order down by one
+    for (int i = 0; i < mux.panel_count; i++) {
+        if (mux.panel_z_order[i] > current_z) {
+            mux.panel_z_order[i]--;
+        }
+    }
+    
+    // Put this panel at the front
+    mux.panel_z_order[panel_index] = mux.panel_count - 1;
+}
+
+void close_panel(int panel_index) {
+    if (panel_index < 0 || panel_index >= mux.panel_count || panel_index == 0) {
+        return; // Can't close main panel (index 0)
+    }
+    
+    terminal_panel_t *panel = &mux.panels[panel_index];
+    
+    // Kill child process
+    if (panel->child_pid > 0) {
+        kill(panel->child_pid, SIGKILL);
+        waitpid(panel->child_pid, NULL, WNOHANG);
+    }
+    
+    // Close file descriptor
+    if (panel->master_fd >= 0) {
+        close(panel->master_fd);
+    }
+    
+    // Free window and screen
+    if (panel->win) {
+        delwin(panel->win);
+    }
+    free_panel_screen(panel);
+    
+    // Mark as inactive
+    panel->active = 0;
+    
+    // Adjust z-order for remaining panels
+    int closed_z = mux.panel_z_order[panel_index];
+    for (int i = 0; i < mux.panel_count; i++) {
+        if (i != panel_index && mux.panel_z_order[i] > closed_z) {
+            mux.panel_z_order[i]--;
+        }
+    }
+    
+    // Compact panel arrays by moving last panel to closed position
+    if (panel_index < mux.panel_count - 1) {
+        mux.panels[panel_index] = mux.panels[mux.panel_count - 1];
+        mux.panel_types[panel_index] = mux.panel_types[mux.panel_count - 1];
+        mux.panel_z_order[panel_index] = mux.panel_z_order[mux.panel_count - 1];
+        
+        // Update z-order references
+        for (int i = 0; i < mux.panel_count; i++) {
+            if (mux.panel_z_order[i] == mux.panel_z_order[panel_index]) {
+                mux.panel_z_order[i] = closed_z;
+                break;
+            }
+        }
+    }
+    
+    mux.panel_count--;
+    
+    // Switch to main panel if we closed the active panel
+    if (mux.active_panel == panel_index || mux.active_panel >= mux.panel_count) {
+        mux.active_panel = 0; // Switch to main panel
+    }
 }
 
 void read_panel_data(terminal_panel_t *panel) {
@@ -384,6 +564,10 @@ void read_panel_data(terminal_panel_t *panel) {
     if (bytes_read > 0) {
         // Feed data to VTE parser
         vte_parser_feed(panel, buffer, bytes_read);
+        
+        // Mark this panel as dirty since it received new data
+        int panel_index = panel - mux.panels;
+        mark_panel_dirty(panel_index);
     } else if (bytes_read == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
         // Error reading from pty
         panel->active = 0;
@@ -418,14 +602,44 @@ void handle_input() {
             case 'n':
             case 'N':
                 // Switch to next panel
+                mark_panel_dirty(mux.active_panel); // Mark old panel dirty
                 mux.active_panel = (mux.active_panel + 1) % mux.panel_count;
+                mark_panel_dirty(mux.active_panel); // Mark new panel dirty
                 exit_command_mode();
                 break;
                 
             case 'p':
             case 'P':
                 // Switch to previous panel
+                mark_panel_dirty(mux.active_panel); // Mark old panel dirty
                 mux.active_panel = (mux.active_panel - 1 + mux.panel_count) % mux.panel_count;
+                mark_panel_dirty(mux.active_panel); // Mark new panel dirty
+                exit_command_mode();
+                break;
+                
+            case 'c':
+            case 'C':
+                // Create new overlay panel
+                create_overlay_panel();
+                mark_all_panels_dirty(); // New panel affects rendering
+                exit_command_mode();
+                break;
+                
+            case 'x':
+            case 'X':
+                // Close current panel (if not main panel)
+                if (mux.active_panel > 0) {
+                    close_panel(mux.active_panel);
+                    mark_all_panels_dirty(); // Panel removal affects rendering
+                }
+                exit_command_mode();
+                break;
+                
+            case 'f':
+            case 'F':
+                // Bring current panel to front
+                bring_panel_to_front(mux.active_panel);
+                mark_all_panels_dirty(); // Z-order change affects all panels
                 exit_command_mode();
                 break;
                 
@@ -438,15 +652,21 @@ void handle_input() {
                 exit_command_mode();
                 break;
                 
+            case '0':
             case '1':
             case '2':
             case '3':
             case '4':
+            case '5':
+            case '6':
+            case '7':
                 // Switch to specific panel
                 {
-                    int panel_num = ch - '1';
+                    int panel_num = (ch == '0') ? 0 : ch - '1' + 1;
                     if (panel_num >= 0 && panel_num < mux.panel_count) {
+                        mark_panel_dirty(mux.active_panel); // Mark old panel dirty
                         mux.active_panel = panel_num;
+                        mark_panel_dirty(mux.active_panel); // Mark new panel dirty
                     }
                     exit_command_mode();
                 }
@@ -513,6 +733,8 @@ void init_multiplexer() {
     mux.should_quit = 0;
     mux.mode = MODE_NORMAL;
     mux.ctrl_count = 0;
+    mux.force_full_redraw = true;
+    mux.status_line_dirty = true;
     
     // Initialize ncurses
     initscr();
@@ -550,27 +772,27 @@ void init_multiplexer() {
         exit(1);
     }
     
-    // Create initial panels
-    mux.panel_count = 2;
+    // Create initial main panel (full screen)
+    mux.panel_count = 1;
     mux.active_panel = 0;
     
-    // Split screen into 2 panels
-    int panel_width = mux.screen_width / 2;
+    // Create single full-screen panel
+    int panel_width = mux.screen_width;
     int panel_height = mux.screen_height - 1; // Leave space for status line
     
     if (create_terminal_panel(&mux.panels[0], 0, 0, 
-                             panel_width, panel_height) == -1) {
+                             panel_width, panel_height, PANEL_TYPE_MAIN) == -1) {
         endwin();
-        fprintf(stderr, "Failed to create panel 0\n");
+        fprintf(stderr, "Failed to create main panel\n");
         exit(1);
     }
     
-    if (create_terminal_panel(&mux.panels[1], panel_width, 0, 
-                             mux.screen_width - panel_width, panel_height) == -1) {
-        endwin();
-        fprintf(stderr, "Failed to create panel 1\n");
-        exit(1);
-    }
+    // Set up initial panel type and z-order
+    mux.panel_types[0] = PANEL_TYPE_MAIN;
+    mux.panel_z_order[0] = 0;
+    
+    // Mark initial panel as dirty for first draw
+    mark_panel_dirty(0);
     
     // Initial draw
     clear();
@@ -636,9 +858,9 @@ int main() {
             }
         }
         
-        // Set timeout for select
+        // Set timeout for select - reduced for better responsiveness
         timeout.tv_sec = 0;
-        timeout.tv_usec = 50000; // 50ms
+        timeout.tv_usec = 16667; // ~60 FPS (16.67ms)
         
         int ready = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
         
@@ -660,26 +882,76 @@ int main() {
             break;
         }
         
-        // Redraw panels
+        // Optimized rendering - only redraw dirty panels
+        bool any_panel_dirty = mux.force_full_redraw;
         for (int i = 0; i < mux.panel_count; i++) {
-            if (mux.panels[i].active) {
-                draw_panel(&mux.panels[i]);
+            if (mux.panel_dirty[i]) {
+                any_panel_dirty = true;
+                break;
             }
         }
         
-        // Status line
-        if (mux.mode == MODE_COMMAND) {
-            wattron(stdscr, A_REVERSE);
-            mvprintw(mux.screen_height - 1, 0, 
-                    " COMMAND MODE | q:quit | n/tab:next | p:prev | 1-4:panel | a:send Ctrl+A | ESC:cancel ");
-            wattroff(stdscr, A_REVERSE);
-        } else {
-            mvprintw(mux.screen_height - 1, 0, 
-                    "Panel: %d | Ctrl+A Ctrl+A: command mode", 
-                    mux.active_panel + 1);
+        if (any_panel_dirty) {
+            // If force_full_redraw, clear screen
+            if (mux.force_full_redraw) {
+                clear();
+            }
+            
+            // Create array of panel indices sorted by z-order
+            int sorted_panels[MAX_PANELS];
+            for (int i = 0; i < mux.panel_count; i++) {
+                sorted_panels[i] = i;
+            }
+            
+            // Simple bubble sort by z-order (low to high)
+            for (int i = 0; i < mux.panel_count - 1; i++) {
+                for (int j = 0; j < mux.panel_count - 1 - i; j++) {
+                    if (mux.panel_z_order[sorted_panels[j]] > mux.panel_z_order[sorted_panels[j + 1]]) {
+                        int temp = sorted_panels[j];
+                        sorted_panels[j] = sorted_panels[j + 1];
+                        sorted_panels[j + 1] = temp;
+                    }
+                }
+            }
+            
+            // Draw panels in z-order, but only if dirty or force redraw
+            for (int i = 0; i < mux.panel_count; i++) {
+                int panel_idx = sorted_panels[i];
+                if (mux.panels[panel_idx].active && 
+                    (mux.panel_dirty[panel_idx] || mux.force_full_redraw)) {
+                    draw_panel(&mux.panels[panel_idx], panel_idx);
+                    mux.panel_dirty[panel_idx] = false; // Clear dirty flag
+                }
+            }
+            
+            mux.force_full_redraw = false;
         }
-        clrtoeol();
-        refresh();
+        
+        // Status line - only redraw if dirty
+        bool status_was_dirty = mux.status_line_dirty;
+        if (mux.status_line_dirty) {
+            // Clear the status line first
+            move(mux.screen_height - 1, 0);
+            clrtoeol();
+            
+            if (mux.mode == MODE_COMMAND) {
+                wattron(stdscr, A_REVERSE);
+                mvprintw(mux.screen_height - 1, 0, 
+                        " COMMAND | q:quit | n:next | p:prev | c:create | x:close | f:front | 0-7:panel | ESC:cancel ");
+                wattroff(stdscr, A_REVERSE);
+            } else {
+                const char *panel_type = (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) ? "Overlay" : "Main";
+                mvprintw(mux.screen_height - 1, 0, 
+                        "%s Panel %d | Ctrl+A Ctrl+A: command mode", 
+                        panel_type, mux.active_panel);
+            }
+            mux.status_line_dirty = false;
+        }
+        
+        // Only refresh if something was drawn
+        if (any_panel_dirty || status_was_dirty) {
+            doupdate(); // More efficient than refresh() when using wnoutrefresh()
+        }
     }
     
     cleanup_multiplexer();
