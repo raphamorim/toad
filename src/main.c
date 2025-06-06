@@ -59,6 +59,8 @@ void close_panel(int panel_index);
 void mark_panel_dirty(int panel_index);
 void mark_all_panels_dirty(void);
 void mark_status_dirty(void);
+void draw_background_pattern(void);
+void draw_colorful_border(WINDOW *win, bool active, panel_type_t type);
 
 void cleanup_and_exit(int sig) {
     (void)sig;
@@ -94,6 +96,94 @@ void mark_all_panels_dirty(void) {
 
 void mark_status_dirty(void) {
     mux.status_line_dirty = true;
+}
+
+void draw_background_pattern(void) {
+    // Draw a decorative pattern background inspired by retro interfaces
+    // Use different characters and colors to create a charming pattern
+    
+    for (int y = 0; y < mux.screen_height - 1; y++) { // Leave space for status line
+        for (int x = 0; x < mux.screen_width; x++) {
+            char pattern_char = ' ';
+            int color_pair = 0;
+            
+            // Create a decorative pattern with dots, stars, and other characters
+            int pattern_x = x % 8;
+            int pattern_y = y % 6;
+            
+            if ((pattern_x == 1 && pattern_y == 1) || (pattern_x == 6 && pattern_y == 4)) {
+                pattern_char = '*';
+                color_pair = 9; // Green stars
+            } else if ((pattern_x == 3 && pattern_y == 2) || (pattern_x == 5 && pattern_y == 5)) {
+                pattern_char = '.';
+                color_pair = 11; // Blue dots
+            } else if ((pattern_x == 0 && pattern_y == 3) || (pattern_x == 7 && pattern_y == 0)) {
+                pattern_char = '+';
+                color_pair = 12; // Magenta plus signs
+            } else if ((pattern_x == 2 && pattern_y == 4) || (pattern_x == 4 && pattern_y == 1)) {
+                pattern_char = 'o';
+                color_pair = 13; // Cyan circles
+            } else {
+                // Background with very subtle pattern
+                if ((x + y) % 4 == 0) {
+                    pattern_char = '.';
+                    color_pair = 15; // Very dim
+                } else {
+                    pattern_char = ' ';
+                    color_pair = 0;
+                }
+            }
+            
+            if (color_pair > 0) {
+                attron(COLOR_PAIR(color_pair));
+            }
+            mvaddch(y, x, pattern_char);
+            if (color_pair > 0) {
+                attroff(COLOR_PAIR(color_pair));
+            }
+        }
+    }
+}
+
+void draw_colorful_border(WINDOW *win, bool active, panel_type_t type) {
+    // Draw colorful borders for panels
+    int border_color = 0;
+    
+    if (active) {
+        // Active panels get bright, colorful borders
+        if (type == PANEL_TYPE_OVERLAY) {
+            border_color = 12; // Bright magenta for active overlays
+        } else {
+            border_color = 10; // Bright yellow for active main panel
+        }
+        wattron(win, COLOR_PAIR(border_color) | A_BOLD);
+    } else {
+        // Inactive panels get softer colors
+        if (type == PANEL_TYPE_OVERLAY) {
+            border_color = 11; // Blue for inactive overlays
+        } else {
+            border_color = 9; // Green for inactive main panel
+        }
+        wattron(win, COLOR_PAIR(border_color));
+    }
+    
+    // Draw the border
+    box(win, 0, 0);
+    
+    // Add corner decorations for active panels
+    if (active) {
+        mvwaddch(win, 0, 0, '+');
+        mvwaddch(win, 0, getmaxx(win) - 1, '+');
+        mvwaddch(win, getmaxy(win) - 1, 0, '+');
+        mvwaddch(win, getmaxy(win) - 1, getmaxx(win) - 1, '+');
+    }
+    
+    if (border_color > 0) {
+        wattroff(win, COLOR_PAIR(border_color));
+        if (active) {
+            wattroff(win, A_BOLD);
+        }
+    }
 }
 
 void init_panel_screen(terminal_panel_t *panel) {
@@ -237,45 +327,48 @@ void draw_panel(terminal_panel_t *panel, int panel_index) {
     
     // Draw different styles based on panel type
     panel_type_t type = mux.panel_types[panel_index];
+    bool is_active = (panel_index == mux.active_panel);
     
+    // Use the colorful border function
+    draw_colorful_border(panel->win, is_active, type);
+    
+    // Add shadow effect for overlay panels
     if (type == PANEL_TYPE_OVERLAY) {
-        // Overlay panels have a thicker border and shadow effect
-        wattron(panel->win, A_BOLD);
-        box(panel->win, 0, 0);
-        wattroff(panel->win, A_BOLD);
-        
-        // Add shadow effect by drawing a simple border offset
         if (panel->start_x + panel->width < mux.screen_width && 
             panel->start_y + panel->height < mux.screen_height) {
-            // Draw shadow on right and bottom
+            // Draw shadow with color
+            attron(COLOR_PAIR(15)); // Dim color for shadow
             for (int y = 1; y <= panel->height; y++) {
-                mvaddch(panel->start_y + y, panel->start_x + panel->width, ' ' | A_REVERSE);
+                mvaddch(panel->start_y + y, panel->start_x + panel->width, ':');
             }
             for (int x = 1; x <= panel->width; x++) {
-                mvaddch(panel->start_y + panel->height, panel->start_x + x, ' ' | A_REVERSE);
+                mvaddch(panel->start_y + panel->height, panel->start_x + x, '.');
             }
+            attroff(COLOR_PAIR(15));
         }
-    } else {
-        // Main panels have normal borders
-        box(panel->win, 0, 0);
     }
     
-    // Draw title with panel type indicator
-    if (panel_index == mux.active_panel) {
+    // Draw colorful title with panel type indicator
+    int title_color = is_active ? (type == PANEL_TYPE_OVERLAY ? 12 : 10) : 
+                                 (type == PANEL_TYPE_OVERLAY ? 11 : 9);
+    
+    wattron(panel->win, COLOR_PAIR(title_color));
+    if (is_active) {
         wattron(panel->win, A_BOLD);
         if (type == PANEL_TYPE_OVERLAY) {
-            mvwprintw(panel->win, 0, 2, " Overlay %d [ACTIVE] ", panel_index);
+            mvwprintw(panel->win, 0, 2, " ✨ Overlay %d [ACTIVE] ✨ ", panel_index);
         } else {
-            mvwprintw(panel->win, 0, 2, " Main Terminal [ACTIVE] ");
+            mvwprintw(panel->win, 0, 2, " 🖥️  Main Terminal [ACTIVE] 🖥️  ");
         }
         wattroff(panel->win, A_BOLD);
     } else {
         if (type == PANEL_TYPE_OVERLAY) {
-            mvwprintw(panel->win, 0, 2, " Overlay %d ", panel_index);
+            mvwprintw(panel->win, 0, 2, " ⭐ Overlay %d ⭐ ", panel_index);
         } else {
-            mvwprintw(panel->win, 0, 2, " Main Terminal ");
+            mvwprintw(panel->win, 0, 2, " 💻 Main Terminal 💻 ");
         }
     }
+    wattroff(panel->win, COLOR_PAIR(title_color));
     
     // Draw screen content
     for (int y = 0; y < panel->screen_height; y++) {
@@ -748,7 +841,7 @@ void init_multiplexer() {
         start_color();
         use_default_colors();
         
-        // Initialize basic color pairs (starting from 8 to avoid conflicts)
+        // Initialize colorful color pairs
         init_pair(8, COLOR_RED, -1);
         init_pair(9, COLOR_GREEN, -1);
         init_pair(10, COLOR_YELLOW, -1);
@@ -757,6 +850,17 @@ void init_multiplexer() {
         init_pair(13, COLOR_CYAN, -1);
         init_pair(14, COLOR_WHITE, -1);
         init_pair(15, COLOR_BLACK, -1);
+        
+        // Additional color combinations for the background pattern
+        if (COLORS >= 16) {
+            // Try to use bright colors if available
+            init_pair(16, COLOR_RED, COLOR_BLACK);
+            init_pair(17, COLOR_GREEN, COLOR_BLACK);
+            init_pair(18, COLOR_YELLOW, COLOR_BLACK);
+            init_pair(19, COLOR_BLUE, COLOR_BLACK);
+            init_pair(20, COLOR_MAGENTA, COLOR_BLACK);
+            init_pair(21, COLOR_CYAN, COLOR_BLACK);
+        }
     }
     
     cbreak();
@@ -809,9 +913,11 @@ void init_multiplexer() {
     
     // Mark initial panel as dirty for first draw
     mark_panel_dirty(0);
+    mux.force_full_redraw = true; // Ensure background is drawn initially
     
-    // Initial draw
+    // Initial draw with background pattern
     clear();
+    draw_background_pattern();
     refresh();
 }
 
@@ -908,9 +1014,10 @@ int main() {
         }
         
         if (any_panel_dirty) {
-            // If force_full_redraw, clear screen
+            // If force_full_redraw, clear screen and draw background pattern
             if (mux.force_full_redraw) {
                 clear();
+                draw_background_pattern();
             }
             
             // Create array of panel indices sorted by z-order
@@ -951,21 +1058,26 @@ int main() {
             clrtoeol();
             
             if (mux.mode == MODE_COMMAND) {
-                wattron(stdscr, A_REVERSE);
+                // Colorful command mode status
+                attron(COLOR_PAIR(10) | A_REVERSE | A_BOLD);
                 mvprintw(mux.screen_height - 1, 0, 
-                        " COMMAND | q:quit | n:next | p:prev | c:create | x:close | f:front | 0-7:panel | ESC:cancel ");
-                wattroff(stdscr, A_REVERSE);
+                        " ⚡ COMMAND MODE ⚡ | q:quit | n:next | p:prev | c:create | x:close | f:front | 0-7:panel | ESC:cancel ");
+                attroff(COLOR_PAIR(10) | A_REVERSE | A_BOLD);
             } else {
-                const char *panel_type = (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) ? "Overlay" : "Main Terminal";
+                // Status line with emojis and colors
+                int status_color = (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) ? 12 : 9;
+                attron(COLOR_PAIR(status_color));
+                
                 if (mux.panel_types[mux.active_panel] == PANEL_TYPE_OVERLAY) {
                     mvprintw(mux.screen_height - 1, 0, 
-                            "%s %d | Ctrl+A Ctrl+A: command mode", 
-                            panel_type, mux.active_panel);
+                            "✨ %s %d ✨ | Ctrl+A Ctrl+A: command mode", 
+                            "Overlay", mux.active_panel);
                 } else {
                     mvprintw(mux.screen_height - 1, 0, 
-                            "%s | Ctrl+A Ctrl+A: command mode", 
-                            panel_type);
+                            "🖥️  %s 🖥️  | Ctrl+A Ctrl+A: command mode", 
+                            "Main Terminal");
                 }
+                attroff(COLOR_PAIR(status_color));
             }
             mux.status_line_dirty = false;
         }
