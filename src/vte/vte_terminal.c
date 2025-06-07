@@ -229,6 +229,9 @@ static void terminal_csi_dispatch(terminal_panel_t *panel, const vte_params_t *p
                             panel->screen[y][x].attrs = A_NORMAL;
                         }
                     }
+                    // Move cursor to home position (0,0) after clearing screen
+                    panel->cursor_x = 0;
+                    panel->cursor_y = 0;
                     break;
             }
             break;
