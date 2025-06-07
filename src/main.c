@@ -464,70 +464,11 @@ void draw_panel(terminal_panel_t *panel, int panel_index) {
         wattroff(panel->win, A_BOLD);
     }
     
-    // Draw cursor for active panel
+    // Position the real cursor for active panel
     if (panel_index == mux.active_panel && 
         panel->cursor_y >= 0 && panel->cursor_y < panel->screen_height &&
         panel->cursor_x >= 0 && panel->cursor_x < panel->screen_width) {
-        
-        // Get the character at cursor position
-        terminal_cell_t *cursor_cell = &panel->screen[panel->cursor_y][panel->cursor_x];
-        
-        // Determine what character to show at cursor
-        char cursor_char = ' ';
-        int cursor_attrs = A_REVERSE;
-        int cursor_color_pair = 0;
-        
-        if (cursor_cell->codepoint != 0 && cursor_cell->codepoint != ' ') {
-            cursor_char = (cursor_cell->codepoint <= 0x7F) ? (char)cursor_cell->codepoint : '?';
-            
-            // Apply the cell's original colors but with reverse video
-            if (cursor_cell->fg_color != -1 || cursor_cell->bg_color != -1) {
-                int fg = (cursor_cell->fg_color == -1) ? -1 : cursor_cell->fg_color;
-                int bg = (cursor_cell->bg_color == -1) ? -1 : cursor_cell->bg_color;
-                
-                // Find or create color pair (same logic as before)
-                bool found = false;
-                for (int i = 1; i < COLOR_PAIRS && i < 64; i++) {
-                    short pair_fg, pair_bg;
-                    pair_content(i, &pair_fg, &pair_bg);
-                    if (pair_fg == fg && pair_bg == bg) {
-                        cursor_color_pair = i;
-                        found = true;
-                        break;
-                    }
-                }
-                
-                if (!found) {
-                    for (int i = 16; i < COLOR_PAIRS && i < 64; i++) {
-                        short pair_fg, pair_bg;
-                        pair_content(i, &pair_fg, &pair_bg);
-                        if (pair_fg == 0 && pair_bg == 0) {
-                            init_pair(i, fg, bg);
-                            cursor_color_pair = i;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            // Combine original attributes with reverse video
-            cursor_attrs = cursor_cell->attrs | A_REVERSE;
-        }
-        
-        // Apply cursor attributes and colors
-        if (cursor_color_pair > 0) {
-            wattron(panel->win, COLOR_PAIR(cursor_color_pair));
-        }
-        wattron(panel->win, cursor_attrs);
-        
-        // Draw the cursor
-        mvwaddch(panel->win, panel->cursor_y + 1, panel->cursor_x + 1, cursor_char);
-        
-        // Remove cursor attributes and colors
-        wattroff(panel->win, cursor_attrs);
-        if (cursor_color_pair > 0) {
-            wattroff(panel->win, COLOR_PAIR(cursor_color_pair));
-        }
+        wmove(panel->win, panel->cursor_y + 1, panel->cursor_x + 1);
     }
     
     // Use wnoutrefresh instead of wrefresh to reduce flickering
@@ -811,6 +752,9 @@ void handle_input() {
                 // Control characters (including Ctrl+C)
                 char c = ch;
                 write(active->master_fd, &c, 1);
+            } else if (ch == 27) {
+                // ESC key
+                write(active->master_fd, "\033", 1);
             } else if (ch >= 32 && ch <= 126) {
                 // Printable characters
                 char c = ch;
