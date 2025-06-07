@@ -10,7 +10,7 @@ static void terminal_print(terminal_panel_t *panel, uint32_t codepoint) {
         terminal_cell_t *cell = &panel->screen[panel->cursor_y][panel->cursor_x];
         
         // Handle DEC special character set
-        if (panel->dec_special_charset && codepoint >= 0x60 && codepoint <= 0x7E) {
+        if (panel->g0_charset == CHARSET_DEC_SPECIAL && !panel->using_g1 && codepoint >= 0x60 && codepoint <= 0x7E) {
             // Map DEC special characters to Unicode box drawing characters
             switch (codepoint) {
                 case 'j': codepoint = 0x2518; break; // ┘
@@ -334,10 +334,10 @@ static void terminal_esc_dispatch(terminal_panel_t *panel, const uint8_t *interm
         if (intermediates[0] == '(') {
             switch (byte) {
                 case '0': // DEC Special Character Set
-                    panel->dec_special_charset = true;
+                    panel->g0_charset = CHARSET_DEC_SPECIAL;
                     return;
                 case 'B': // ASCII character set
-                    panel->dec_special_charset = false;
+                    panel->g0_charset = CHARSET_ASCII;
                     return;
             }
         }

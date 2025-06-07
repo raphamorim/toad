@@ -220,10 +220,9 @@ void init_panel_screen(terminal_panel_t *panel) {
     // Initialize VTE parser and set up terminal perform implementation
     vte_parser_init(&panel->parser);
     panel->perform = terminal_perform;
-    panel->fg_color = -1;
-    panel->bg_color = -1;
-    panel->attrs = A_NORMAL;
-    panel->dec_special_charset = false;
+    
+    // Initialize with enhanced terminal functions
+    terminal_panel_init(panel, panel->screen_width, panel->screen_height);
 }
 
 void free_panel_screen(terminal_panel_t *panel) {

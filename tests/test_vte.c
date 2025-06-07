@@ -28,117 +28,42 @@ static size_t output_pos = 0;
 
 // Test perform implementation
 static void test_print(terminal_panel_t *panel, uint32_t codepoint) {
-    if (panel->cursor_y >= 0 && panel->cursor_y < 10 &&
-        panel->cursor_x >= 0 && panel->cursor_x < 40) {
-        
-        terminal_cell_t *cell = &test_screen[panel->cursor_y][panel->cursor_x];
-        cell->codepoint = codepoint;
-        cell->fg_color = panel->fg_color;
-        cell->bg_color = panel->bg_color;
-        cell->attrs = panel->attrs;
-        
-        // Also add to output buffer for text verification
-        if (output_pos < sizeof(output_buffer) - 1) {
-            output_buffer[output_pos++] = (char)codepoint;
-        }
-        
-        panel->cursor_x++;
-        if (panel->cursor_x >= 40) {
-            panel->cursor_x = 0;
-            panel->cursor_y++;
-        }
+    // Use the enhanced print function but also update output buffer
+    enhanced_print(panel, codepoint);
+    
+    // Also add to output buffer for text verification
+    if (output_pos < sizeof(output_buffer) - 1) {
+        output_buffer[output_pos++] = (char)codepoint;
     }
 }
 
 static void test_execute(terminal_panel_t *panel, uint8_t byte) {
+    // Use the enhanced execute function but also update output buffer
+    enhanced_execute(panel, byte);
+    
     if (byte == '\n' && output_pos < sizeof(output_buffer) - 1) {
         output_buffer[output_pos++] = '\n';
-        panel->cursor_x = 0;
-        panel->cursor_y++;
-    } else if (byte == '\r') {
-        panel->cursor_x = 0;
     }
 }
 
 static void test_csi_dispatch(terminal_panel_t *panel, const vte_params_t *params,
                              const uint8_t *intermediates, size_t intermediate_len,
                              bool ignore, char action) {
-    (void)intermediates; (void)intermediate_len; (void)ignore;
-    
-    if (action == 'm') {
-        if (vte_params_len(params) == 0) {
-            panel->fg_color = -1;
-            panel->bg_color = -1;
-            panel->attrs = 0;
-            return;
-        }
-        
-        for (size_t i = 0; i < vte_params_len(params); i++) {
-            uint16_t param = vte_params_get_single(params, i, 0);
-            
-            switch (param) {
-                case 0:
-                    panel->fg_color = -1;
-                    panel->bg_color = -1;
-                    panel->attrs = 0;
-                    break;
-                case 1:
-                    panel->attrs |= 1; // Bold (simplified)
-                    break;
-                case 4:
-                    panel->attrs |= 2; // Underline (simplified)
-                    break;
-                case 7:
-                    panel->attrs |= 4; // Reverse (simplified)
-                    break;
-                case 22:
-                    panel->attrs &= ~1; // No bold
-                    break;
-                case 24:
-                    panel->attrs &= ~2; // No underline
-                    break;
-                case 27:
-                    panel->attrs &= ~4; // No reverse
-                    break;
-                case 30: case 31: case 32: case 33:
-                case 34: case 35: case 36: case 37:
-                    panel->fg_color = param - 30;
-                    break;
-                case 39:
-                    panel->fg_color = -1; // Default foreground
-                    break;
-                case 40: case 41: case 42: case 43:
-                case 44: case 45: case 46: case 47:
-                    panel->bg_color = param - 40;
-                    break;
-                case 49:
-                    panel->bg_color = -1; // Default background
-                    break;
-                case 90: case 91: case 92: case 93:
-                case 94: case 95: case 96: case 97:
-                    panel->fg_color = param - 90;
-                    panel->attrs |= 1; // Bright colors are bold
-                    break;
-                case 100: case 101: case 102: case 103:
-                case 104: case 105: case 106: case 107:
-                    panel->bg_color = param - 100;
-                    break;
-            }
-        }
-    } else if (action == 'H' || action == 'f') { // Cursor position
-        uint16_t row = vte_params_get_single(params, 0, 1) - 1;
-        uint16_t col = vte_params_get_single(params, 1, 1) - 1;
-        
-        if (row < panel->screen_height) panel->cursor_y = row;
-        if (col < panel->screen_width) panel->cursor_x = col;
-    }
+    // Use the enhanced CSI dispatch from vte_parser.c
+    enhanced_csi_dispatch(panel, params, intermediates, intermediate_len, ignore, action);
+}
+
+static void test_esc_dispatch(terminal_panel_t *panel, const uint8_t *intermediates,
+                             size_t intermediate_len, bool ignore, uint8_t byte) {
+    // Use the enhanced ESC dispatch from vte_parser.c
+    enhanced_esc_dispatch(panel, intermediates, intermediate_len, ignore, byte);
 }
 
 static const vte_perform_t test_perform = {
     .print = test_print,
     .execute = test_execute,
     .csi_dispatch = test_csi_dispatch,
-    .esc_dispatch = NULL,
+    .esc_dispatch = test_esc_dispatch,
     .osc_dispatch = NULL,
     .hook = NULL,
     .put = NULL,
@@ -155,11 +80,9 @@ void setup_test() {
     for (int i = 0; i < 10; i++) {
         test_panel.screen[i] = test_screen[i];
     }
-    test_panel.screen_width = 40;
-    test_panel.screen_height = 10;
-    test_panel.fg_color = -1;
-    test_panel.bg_color = -1;
-    test_panel.attrs = 0;
+    
+    // Initialize with enhanced terminal functions
+    terminal_panel_init(&test_panel, 40, 10);
     
     vte_parser_init(&test_panel.parser);
     test_panel.perform = test_perform;
@@ -386,6 +309,230 @@ int test_cursor_positioning() {
     return 1;
 }
 
+int test_cursor_movement() {
+    setup_test();
+    
+    // Test cursor up/down/left/right
+    parse_input("Hello\033[3D\033[2A*");  // Move left 3, up 2, print *
+    
+    // Should be at position (2, -2) but clamped to (2, 0)
+    if (test_panel.cursor_x != 3 || test_panel.cursor_y != 0) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Test cursor positioning
+    parse_input("\033[5;10H+");  // Move to row 5, col 10, print +
+    if (test_panel.cursor_x != 10 || test_panel.cursor_y != 4) {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_screen_clearing() {
+    setup_test();
+    
+    // Fill screen with text
+    parse_input("Line1\nLine2\nLine3\n");
+    
+    // Clear from cursor to end of screen
+    parse_input("\033[2;3H\033[0J");
+    
+    // Check that content before cursor is preserved
+    if (test_screen[0][0].codepoint != 'L' || test_screen[1][0].codepoint != 'L') {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Check that content after cursor is cleared
+    if (test_screen[1][3].codepoint != ' ' || test_screen[2][0].codepoint != ' ') {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_line_operations() {
+    setup_test();
+    
+    // Add some lines
+    parse_input("Line1\nLine2\nLine3\n");
+    
+    // Go to line 2 and insert a line
+    parse_input("\033[2H\033[1L");
+    
+    // Line 2 should now be empty, Line 3 should have "Line2"
+    if (test_screen[1][0].codepoint != ' ' || test_screen[2][0].codepoint != 'L') {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Delete the inserted line
+    parse_input("\033[1M");
+    
+    // Line 2 should now have "Line2" again
+    if (test_screen[1][0].codepoint != 'L' || test_screen[1][4].codepoint != '2') {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_character_operations() {
+    setup_test();
+    
+    // Type some text
+    parse_input("Hello World");
+    
+    // Go back and insert characters
+    parse_input("\033[6G\033[3@");  // Go to column 6, insert 3 chars
+    
+    // Should have "Hello    World" with cursor at position 5
+    if (test_screen[0][5].codepoint != ' ' || test_screen[0][9].codepoint != 'W') {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Delete some characters
+    parse_input("\033[2P");  // Delete 2 characters
+    
+    // Should have "Hello  World" 
+    if (test_screen[0][5].codepoint != ' ' || test_screen[0][7].codepoint != 'W') {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_scrolling_regions() {
+    setup_test();
+    
+    // Set scrolling region from line 2 to 4
+    parse_input("\033[2;4r");
+    
+    if (test_panel.scroll_top != 1 || test_panel.scroll_bottom != 3) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Cursor should be at home position
+    if (test_panel.cursor_x != 0 || test_panel.cursor_y != 0) {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_tab_operations() {
+    setup_test();
+    
+    // Test basic tab
+    parse_input("A\tB");
+    if (test_panel.cursor_x != 9) {  // Should be at next tab stop (8) + 1 for 'B'
+        cleanup_test();
+        return 0;
+    }
+    
+    // Set a custom tab stop
+    parse_input("\033[15G\033H");  // Go to column 15, set tab
+    
+    // Test custom tab (don't clear all tabs first)
+    parse_input("\033[1G\t");  // Go to start, tab to first tab stop (8)
+    if (test_panel.cursor_x != 8) {  // Should be at first tab stop (8)
+        cleanup_test();
+        return 0;
+    }
+    
+    // Tab again to custom tab stop
+    parse_input("\t");  // Tab to custom tab stop (14)
+    if (test_panel.cursor_x != 14) {  // Should be at custom tab (14)
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_character_sets() {
+    setup_test();
+    
+    // Switch to DEC special character set and draw a line
+    parse_input("\033(0qqq\033(B");  // G0 = DEC special, draw line, G0 = ASCII
+    
+    // Check that line drawing characters were mapped
+    if (test_screen[0][0].codepoint != 0x2500) {  // Horizontal line
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_save_restore_cursor() {
+    setup_test();
+    
+    // Move cursor and set attributes
+    parse_input("\033[5;10H\033[31mRed");
+    
+    // Save cursor
+    parse_input("\033[s");
+    
+    // Move elsewhere and change attributes
+    parse_input("\033[1;1H\033[32mGreen");
+    
+    // Restore cursor
+    parse_input("\033[u");
+    
+    // Should be back at (5,10) with red color after printing "Red"
+    if (test_panel.cursor_x != 12 || test_panel.cursor_y != 4 || test_panel.fg_color != 1) {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
+int test_terminal_modes() {
+    setup_test();
+    
+    // Test application cursor keys mode
+    parse_input("\033[?1h");  // Set application cursor keys
+    if (!test_panel.modes.application_cursor_keys) {
+        cleanup_test();
+        return 0;
+    }
+    
+    parse_input("\033[?1l");  // Reset application cursor keys
+    if (test_panel.modes.application_cursor_keys) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Test auto wrap mode
+    parse_input("\033[?7l");  // Disable auto wrap
+    if (test_panel.modes.auto_wrap) {
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
 int test_complex_sequences() {
     setup_test();
     
@@ -417,6 +564,27 @@ int test_complex_sequences() {
     return 1;
 }
 
+int test_extended_colors() {
+    setup_test();
+    
+    // Test 256-color mode
+    parse_input("\033[38;5;196mBright Red");
+    if (test_panel.fg_color != 196) {
+        cleanup_test();
+        return 0;
+    }
+    
+    // Test RGB color mode (simplified)
+    parse_input("\033[38;2;255;0;0mRGB Red");
+    if (test_panel.fg_color != 1) {  // Should map to basic red
+        cleanup_test();
+        return 0;
+    }
+    
+    cleanup_test();
+    return 1;
+}
+
 int main() {
     printf("🧪 Running VTE Parser Test Suite\n");
     printf("================================\n\n");
@@ -432,6 +600,16 @@ int main() {
     TEST(utf8_utilities);
     TEST(cursor_positioning);
     TEST(complex_sequences);
+    TEST(cursor_movement);
+    TEST(screen_clearing);
+    TEST(line_operations);
+    TEST(character_operations);
+    TEST(scrolling_regions);
+    TEST(tab_operations);
+    TEST(character_sets);
+    TEST(save_restore_cursor);
+    TEST(terminal_modes);
+    TEST(extended_colors);
     
     // Print results
     printf("\n📊 Test Results\n");

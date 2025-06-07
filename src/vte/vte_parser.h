@@ -108,6 +108,36 @@ typedef struct {
     int attrs;
 } terminal_cell_t;
 
+// Terminal modes
+typedef struct {
+    bool application_cursor_keys;
+    bool application_keypad;
+    bool auto_wrap;
+    bool origin_mode;
+    bool insert_mode;
+    bool local_echo;
+    bool cursor_visible;
+    bool reverse_video;
+    bool bracketed_paste;
+} terminal_modes_t;
+
+// Character sets
+typedef enum {
+    CHARSET_ASCII,
+    CHARSET_DEC_SPECIAL,
+    CHARSET_UK,
+    CHARSET_DUTCH,
+    CHARSET_FINNISH,
+    CHARSET_FRENCH,
+    CHARSET_FRENCH_CANADIAN,
+    CHARSET_GERMAN,
+    CHARSET_ITALIAN,
+    CHARSET_NORWEGIAN_DANISH,
+    CHARSET_SPANISH,
+    CHARSET_SWEDISH,
+    CHARSET_SWISS
+} charset_t;
+
 // Terminal panel structure
 struct terminal_panel {
     void *win;  // WINDOW pointer (void* to avoid ncurses dependency in header)
@@ -119,7 +149,9 @@ struct terminal_panel {
     int width, height;
     int start_x, start_y;
     int cursor_x, cursor_y;
+    int saved_cursor_x, saved_cursor_y;  // For save/restore cursor
     int screen_width, screen_height;
+    int scroll_top, scroll_bottom;  // Scrolling region
     vte_parser_t parser;
     vte_perform_t perform;
     
@@ -127,9 +159,17 @@ struct terminal_panel {
     int fg_color;
     int bg_color;
     int attrs;
+    int saved_fg_color, saved_bg_color, saved_attrs;  // For save/restore cursor
     
     // Character set state
-    bool dec_special_charset;  // True when using DEC special character set
+    charset_t g0_charset, g1_charset;  // G0 and G1 character sets
+    bool using_g1;  // True when G1 is active
+    
+    // Terminal modes
+    terminal_modes_t modes;
+    
+    // Tab stops
+    bool tab_stops[256];  // Tab stop positions
 };
 
 // Function declarations
@@ -157,6 +197,18 @@ uint32_t vte_utf8_decode(const uint8_t *bytes, size_t len);
 // Default perform implementation
 extern const vte_perform_t vte_default_perform;
 
+// Enhanced perform functions for testing
+void enhanced_csi_dispatch(terminal_panel_t *panel, const vte_params_t *params,
+                           const uint8_t *intermediates, size_t intermediate_len,
+                           bool ignore, char action);
+void enhanced_esc_dispatch(terminal_panel_t *panel, const uint8_t *intermediates,
+                          size_t intermediate_len, bool ignore, uint8_t byte);
+void enhanced_print(terminal_panel_t *panel, uint32_t codepoint);
+void enhanced_execute(terminal_panel_t *panel, uint8_t byte);
+
+// Enhanced perform implementation
+extern const vte_perform_t enhanced_perform;
+
 // Terminal-specific perform implementation
 extern const vte_perform_t terminal_perform;
 
@@ -165,5 +217,33 @@ void vte_parser_feed(terminal_panel_t *panel, const char *data, size_t len);
 
 // Color mapping
 int ansi_to_ncurses_color(int ansi_color);
+
+// Character set mapping
+uint32_t map_charset_char(charset_t charset, uint8_t ch);
+
+// Terminal initialization
+void terminal_panel_init(terminal_panel_t *panel, int width, int height);
+void terminal_panel_reset(terminal_panel_t *panel);
+
+// Screen manipulation
+void terminal_clear_screen(terminal_panel_t *panel, int mode);
+void terminal_clear_line(terminal_panel_t *panel, int mode);
+void terminal_scroll_up(terminal_panel_t *panel, int lines);
+void terminal_scroll_down(terminal_panel_t *panel, int lines);
+void terminal_insert_lines(terminal_panel_t *panel, int count);
+void terminal_delete_lines(terminal_panel_t *panel, int count);
+void terminal_insert_chars(terminal_panel_t *panel, int count);
+void terminal_delete_chars(terminal_panel_t *panel, int count);
+
+// Cursor operations
+void terminal_save_cursor(terminal_panel_t *panel);
+void terminal_restore_cursor(terminal_panel_t *panel);
+void terminal_set_cursor_visible(terminal_panel_t *panel, bool visible);
+
+// Tab operations
+void terminal_set_tab_stop(terminal_panel_t *panel);
+void terminal_clear_tab_stop(terminal_panel_t *panel, int mode);
+void terminal_tab_forward(terminal_panel_t *panel, int count);
+void terminal_tab_backward(terminal_panel_t *panel, int count);
 
 #endif // VTE_PARSER_H
