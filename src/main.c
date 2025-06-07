@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <util.h>
+#include <locale.h>
 #include <time.h>
 
 #include <ncurses.h>
@@ -222,6 +223,7 @@ void init_panel_screen(terminal_panel_t *panel) {
     panel->fg_color = -1;
     panel->bg_color = -1;
     panel->attrs = A_NORMAL;
+    panel->dec_special_charset = false;
 }
 
 void free_panel_screen(terminal_panel_t *panel) {
@@ -772,6 +774,9 @@ void init_multiplexer() {
     mux.ctrl_count = 0;
     mux.force_full_redraw = true;
     mux.status_line_dirty = true;
+    
+    // Initialize locale for UTF-8 support
+    setlocale(LC_ALL, "");
     
     // Initialize ncurses
     initscr();

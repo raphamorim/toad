@@ -8,6 +8,26 @@ static void terminal_print(terminal_panel_t *panel, uint32_t codepoint) {
         panel->cursor_x >= 0 && panel->cursor_x < panel->screen_width) {
         
         terminal_cell_t *cell = &panel->screen[panel->cursor_y][panel->cursor_x];
+        
+        // Handle DEC special character set
+        if (panel->dec_special_charset && codepoint >= 0x60 && codepoint <= 0x7E) {
+            // Map DEC special characters to Unicode box drawing characters
+            switch (codepoint) {
+                case 'j': codepoint = 0x2518; break; // ┘
+                case 'k': codepoint = 0x2510; break; // ┐
+                case 'l': codepoint = 0x250C; break; // ┌
+                case 'm': codepoint = 0x2514; break; // └
+                case 'n': codepoint = 0x253C; break; // ┼
+                case 'q': codepoint = 0x2500; break; // ─
+                case 't': codepoint = 0x251C; break; // ├
+                case 'u': codepoint = 0x2524; break; // ┤
+                case 'v': codepoint = 0x2534; break; // ┴
+                case 'w': codepoint = 0x252C; break; // ┬
+                case 'x': codepoint = 0x2502; break; // │
+                default: break; // Keep original character
+            }
+        }
+        
         cell->codepoint = codepoint;
         cell->fg_color = panel->fg_color;
         cell->bg_color = panel->bg_color;
@@ -308,6 +328,20 @@ static void terminal_csi_dispatch(terminal_panel_t *panel, const vte_params_t *p
 static void terminal_esc_dispatch(terminal_panel_t *panel, const uint8_t *intermediates,
                                  size_t intermediate_len, bool ignore, uint8_t byte) {
     if (ignore) return;
+    
+    // Handle character set switching
+    if (intermediate_len == 1) {
+        if (intermediates[0] == '(') {
+            switch (byte) {
+                case '0': // DEC Special Character Set
+                    panel->dec_special_charset = true;
+                    return;
+                case 'B': // ASCII character set
+                    panel->dec_special_charset = false;
+                    return;
+            }
+        }
+    }
     
     // Handle common escape sequences
     switch (byte) {

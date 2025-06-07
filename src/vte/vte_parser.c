@@ -24,21 +24,21 @@ uint32_t vte_utf8_decode(const uint8_t *bytes, size_t len) {
         return first;
     }
     
-    if (len < 2 || (first & 0xE0) == 0xC0) {
+    if ((first & 0xE0) == 0xC0) {
         if (len >= 2) {
             return ((first & 0x1F) << 6) | (bytes[1] & 0x3F);
         }
         return 0xFFFD; // Replacement character
     }
     
-    if (len < 3 || (first & 0xF0) == 0xE0) {
+    if ((first & 0xF0) == 0xE0) {
         if (len >= 3) {
             return ((first & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
         }
         return 0xFFFD;
     }
     
-    if (len < 4 || (first & 0xF8) == 0xF0) {
+    if ((first & 0xF8) == 0xF0) {
         if (len >= 4) {
             return ((first & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) | 
                    ((bytes[2] & 0x3F) << 6) | (bytes[3] & 0x3F);

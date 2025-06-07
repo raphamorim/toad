@@ -127,6 +127,9 @@ struct terminal_panel {
     int fg_color;
     int bg_color;
     int attrs;
+    
+    // Character set state
+    bool dec_special_charset;  // True when using DEC special character set
 };
 
 // Function declarations
